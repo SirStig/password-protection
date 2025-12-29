@@ -114,7 +114,7 @@ export default class PasswordPlugin extends Plugin {
                     if (curTime.diff(this.settings.timeOnUnload, 'second') <= 2 && this.settings.isLastVerifyPasswordCorrect) {
                         this.isVerifyPasswordCorrect = true;
                     } else {
-                        this.verifyPasswordProtection();
+                        this.verifyPasswordProtection(false);
                     }
                 }
             }
@@ -125,7 +125,7 @@ export default class PasswordPlugin extends Plugin {
             if (file != null) {
                 this.autoLockCheck();
                 if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect && this.isProtectedFile(file.path)) {
-                    this.verifyPasswordProtection();
+                    this.verifyPasswordProtection(false);
                 }
                 // update the time of last open file, the file may be protected and may be not.
                 if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
@@ -142,7 +142,7 @@ export default class PasswordPlugin extends Plugin {
                     this.autoLockCheck();
                     if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect) {
                         // show the password dialog
-                        this.verifyPasswordProtection();
+                        this.verifyPasswordProtection(true);
                     }
                     // update the time of last search view actived.
                     if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
@@ -177,7 +177,7 @@ export default class PasswordPlugin extends Plugin {
     ) => {
         if (file != null) {
             if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect && (this.isProtectedFile(oldPath) || this.isProtectedFile(file.path))) {
-                this.verifyPasswordProtection();
+                this.verifyPasswordProtection(false);
             }
             if (this.settings.protectEnabled && this.isProtectedFile(oldPath)) {
                 this.ReplaceProtectedPath(oldPath, file.path);
@@ -207,7 +207,7 @@ export default class PasswordPlugin extends Plugin {
             if (curTime.diff(this.lastUnlockOrOpenFileTime, 'minute') >= this.settings.autoLockInterval) {
                 if (this.isProtectFileOpened()) {
                     this.isVerifyPasswordCorrect = false;
-                    this.verifyPasswordProtection();
+                    this.verifyPasswordProtection(false);
                 } else {
                     this.isVerifyPasswordCorrect = false;
                 }
@@ -275,14 +275,14 @@ export default class PasswordPlugin extends Plugin {
                 this.isVerifyPasswordCorrect = false;
             }
 
-            this.verifyPasswordProtection();
+            this.verifyPasswordProtection(false);
         }
     }
 
     // verify password protection
-    verifyPasswordProtection() {
+    verifyPasswordProtection(forbidCloseModal: boolean) {
         if (!this.isVerifyPasswordWaitting) {
-            const setModal = new VerifyPasswordModal(this.app, this, () => {
+            const setModal = new VerifyPasswordModal(this.app, this, forbidCloseModal, () => {
                 if (this.isVerifyPasswordCorrect) {
                     new Notice(this.t("password_protection_closed"));
                 } else {
@@ -487,7 +487,7 @@ class PasswordSettingTab extends PluginSettingTab {
                             }).open();
                         } else {
                             if (!this.plugin.isVerifyPasswordWaitting) {
-                                const setModal = new VerifyPasswordModal(this.app, this.plugin, () => {
+                                const setModal = new VerifyPasswordModal(this.app, this.plugin, false, () => {
                                     if (this.plugin.isVerifyPasswordCorrect) {
                                         this.plugin.settings.protectEnabled = false;
                                         this.plugin.saveSettings();
@@ -760,24 +760,26 @@ class SetPasswordModal extends Modal {
 
 class VerifyPasswordModal extends Modal {
     plugin: PasswordPlugin;
+	forbidCloseModal: boolean;
     onSubmit: () => void;
 
-    constructor(app: App, plugin: PasswordPlugin, onSubmit: () => void) {
+    constructor(app: App, plugin: PasswordPlugin, forbidCloseModal: boolean, onSubmit: () => void) {
         super(app);
         this.plugin = plugin;
         this.plugin.isVerifyPasswordWaitting = true;
         this.plugin.isVerifyPasswordCorrect = false;
+		this.forbidCloseModal = forbidCloseModal;
         this.onSubmit = onSubmit;
     }
 
     onOpen() {
-        //if (this.plugin.settings.protectEnabled) {
-        //    const { modalEl } = this;
-        //    const closeButton = modalEl.getElementsByClassName('modal-close-button')[0];
-        //    if (closeButton != null) {
-        //        closeButton.setAttribute('style', 'display: none;');
-        //    }
-        //}
+        if (this.forbidCloseModal) {
+           const { modalEl } = this;
+           const closeButton = modalEl.getElementsByClassName('modal-close-button')[0];
+           if (closeButton != null) {
+               closeButton.setAttribute('style', 'display: none;');
+           }
+        }
 
         Object.assign(this.app.workspace.containerEl.style, {
             filter: "blur(8px)",
@@ -886,7 +888,17 @@ class VerifyPasswordModal extends Modal {
         this.plugin.isVerifyPasswordWaitting = false;
         const { contentEl } = this;
         contentEl.empty();
-        this.restoreBlur();
-        this.onSubmit();
+
+        if (this.forbidCloseModal) {
+            if (!this.plugin.isVerifyPasswordCorrect) {
+                const setModal = new VerifyPasswordModal(this.app, this.plugin, true, this.onSubmit).open();
+            } else {
+                this.restoreBlur();
+                this.onSubmit();
+            }
+        } else {
+            this.restoreBlur();
+            this.onSubmit();
+        }
     }
 }
