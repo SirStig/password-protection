@@ -35,5 +35,8 @@
   "setting_add_path": "添加保護路徑",
   "setting_add_path_name": "保護路徑",
   "setting_add_path_place_holder": "輸入路徑，比如：我的筆記/日記",
-  "setting_remove_path": "移除保護路徑"
+  "setting_remove_path": "移除保護路徑",
+  "locked_embed": "🔒 受保護的內容 — 解鎖後查看",
+  "notice_locked_write_blocked": "此文件已加密且密碼保護處於鎖定狀態，請先解鎖再編輯。",
+  "notice_decrypt_failed": "無法解密 {{path}}。文件可能已損壞或使用了其他密碼加密。"
 }

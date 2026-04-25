@@ -1,8 +1,54 @@
-/*
+.pw-protected-embed {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--background-modifier-border);
+    background-color: var(--background-secondary);
+    color: var(--text-muted);
+    font-style: italic;
+    cursor: default;
+    user-select: none;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.pw-input-row {
+    margin-bottom: 1em;
+}
 
-If your plugin does not need CSS, delete this file.
+.pw-input-row input[type="password"] {
+    width: 70%;
+}
 
-*/
+.pw-message {
+    margin-bottom: 1em;
+}
+
+.pw-path-input .setting-item-control {
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.pw-path-status {
+    font-size: 0.85em;
+    color: var(--text-muted);
+    margin-left: 4px;
+}
+
+.pw-path-action button {
+    margin-left: 4px;
+}
+
+.pw-bulk-status {
+    margin-bottom: 1em;
+    font-family: var(--font-monospace);
+    font-size: 0.9em;
+    word-break: break-all;
+}
+
+.pw-bulk-failure-hint {
+    color: var(--text-error);
+    margin-top: 0.5em;
+    font-size: 0.85em;
+}

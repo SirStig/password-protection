@@ -1,904 +1,1575 @@
-import { App, normalizePath, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, setIcon, WorkspaceLeaf, FileView, moment } from 'obsidian';
-import { I18n } from "./i18n";
-import type { LangType, LangTypeAndAuto, TransItemType } from "./i18n";
+import {
+    App,
+    normalizePath,
+    Menu,
+    Modal,
+    MarkdownRenderChild,
+    MarkdownView,
+    Notice,
+    Plugin,
+    PluginSettingTab,
+    Setting,
+    TAbstractFile,
+    TFile,
+    WorkspaceLeaf,
+    FileView,
+    moment,
+} from 'obsidian';
+import { I18n } from './i18n';
+import type { LangTypeAndAuto, TransItemType } from './i18n';
+import {
+    hashPassword,
+    verifyPasswordHash,
+    legacyVerify,
+    deriveEncryptionKey,
+    base64ToBuf,
+} from './src/crypto';
+import {
+    ROOT_PATH,
+    ADD_PATH_MAX,
+    isProtectedPath,
+    replaceProtectedPath,
+} from './src/path-utils';
+import {
+    PasswordPluginSettings,
+    migrateSettings,
+    mirrorLegacyToPaths,
+} from './src/settings';
+import { isEncryptedFile } from './src/encryption';
+import { installVaultPatches, VaultPatchHandle } from './src/vault-patch';
+import {
+    BulkProgress,
+    BulkProgressCallback,
+    BulkResult,
+    countEncryptedInFolder,
+    countEncryptedVaultWide,
+    decryptFolder,
+    decryptSingleFile,
+    encryptFolder,
+    encryptSingleFile,
+    reencryptAll,
+} from './src/bulk-ops';
+import { ProtectionMode } from './src/path-utils';
 
-const ADD_PATH_MAX = 6;
 const PASSWORD_LENGTH_MIN = 1;
 const PASSWORD_LENGTH_MAX = 20;
-const ENCRYPT_KEY = 30;
-const ROOT_PATH = normalizePath("/");
-const SOLID_PASS = 'qBjSbeiu2qDNEq5d';
 
-interface PasswordPluginSettings {
-    // the protected path: the default value is root path
-    protectedPath: string;
-
-    // more protected paths 
-    addedProtectedPath: string[];
-
-    // if the password protection is enabled
-    protectEnabled: boolean;
-
-    // the password, it will be encrypted and saved
-    password: string;
-
-    // the language type, it can be 'auto' or a specific language code
-    lang: LangTypeAndAuto;
-
-    // when the auto lock interval is set, it will auto lock the password protection after the interval
-    autoLockInterval: number;
-
-    // the password hint question, it will be shown when the password is not correct
-    pwdHintQuestion: string;
-
-    // if the last verify password is correct, it will be used to determine if the password protection should be closed
-    isLastVerifyPasswordCorrect: boolean;
-
-    // close the obsidian and open it again, if the time difference is less than 2 seconds, it will be considered as the last verify password is correct
-    timeOnUnload: moment.Moment | number;
-}
-
-const DEFAULT_SETTINGS: PasswordPluginSettings = {
-    protectedPath: ROOT_PATH,
-    addedProtectedPath: [],
-    protectEnabled: false,
-    password: '',
-    lang: "auto",
-    autoLockInterval: 0,
-    pwdHintQuestion: '',
-    isLastVerifyPasswordCorrect: false,
-    timeOnUnload: 0
-}
+// View types that aggregate content and may expose protected note excerpts.
+const AGGREGATE_VIEW_TYPES = new Set(['search', 'backlink', 'outgoing-link', 'tag']);
 
 export default class PasswordPlugin extends Plugin {
     settings: PasswordPluginSettings;
-    isVerifyPasswordWaitting: boolean = false;
-    isVerifyPasswordCorrect: boolean = false;
-    isAutoLockRegistered: boolean = false;
+    isVerifyPasswordWaitting = false;
+    isVerifyPasswordCorrect = false;
     lastUnlockOrOpenFileTime: moment.Moment | null = null;
-
     passwordRibbonBtn: HTMLElement;
     i18n: I18n;
 
-    t = (x: TransItemType, vars?: any) => {
-        return this.i18n.t(x, vars);
-    };
+    // In-memory key for AES-GCM file encryption. Set on successful unlock,
+    // zeroed on every transition that locks the vault. Never persisted.
+    encryptionKey: Uint8Array | null = null;
+    vaultPatchHandle: VaultPatchHandle | null = null;
+
+    t = (x: TransItemType, vars?: Record<string, string>) => this.i18n.t(x, vars);
+
+    // True when saved data uses the legacy v1 cipher rather than a v2 PBKDF2 hash.
+    get isLegacyPassword(): boolean {
+        return this.settings.password !== '' && this.settings.passwordData === null;
+    }
+
+    async setEncryptionKeyFromPassword(password: string): Promise<void> {
+        if (!this.settings.passwordData) return;
+        const salt = base64ToBuf(this.settings.passwordData.salt);
+        this.encryptionKey = await deriveEncryptionKey(password, salt);
+    }
+
+    clearEncryptionKey(): void {
+        if (this.encryptionKey) this.encryptionKey.fill(0);
+        this.encryptionKey = null;
+    }
+
+    requireEncryptionKey(): Uint8Array {
+        if (!this.encryptionKey) {
+            throw new Error('Vault is locked: encryption key is not loaded.');
+        }
+        return this.encryptionKey;
+    }
 
     async onload() {
         await this.loadSettings();
 
         this.lastUnlockOrOpenFileTime = moment();
 
-        // check if the protected path is empty, if so, set to root path
-        this.settings.protectedPath = this.settings.protectedPath.trim();
-        if (this.settings.protectedPath.length == 0 ) {
-            this.settings.protectedPath = ROOT_PATH;
-        }
+        this.settings.protectedPath = this.settings.protectedPath.trim() || ROOT_PATH;
 
-        // check if the added protected path array exceed the limit, if so, remove the extra
+        // Fix: the original code called .slice() without assigning the result.
         if (this.settings.addedProtectedPath.length > ADD_PATH_MAX) {
-            this.settings.addedProtectedPath.slice(ADD_PATH_MAX, this.settings.addedProtectedPath.length - ADD_PATH_MAX);
+            this.settings.addedProtectedPath = this.settings.addedProtectedPath.slice(0, ADD_PATH_MAX);
         }
+        this.settings.addedProtectedPath = this.settings.addedProtectedPath.filter(
+            (s) => s.trim() !== ''
+        );
 
-        // check if the added protected path is empty, if so, remove it
-        this.settings.addedProtectedPath = this.settings.addedProtectedPath.filter(str => str.trim() !== '');
-
-        // lang should be load early, but after settings
         this.i18n = new I18n(this.settings.lang, async (lang: LangTypeAndAuto) => {
             this.settings.lang = lang;
             await this.saveSettings();
         });
 
-        // This creates an icon in the left ribbon.
-        this.passwordRibbonBtn = this.addRibbonIcon('lock', this.t("open_password_protection"), (evt: MouseEvent) => {
-            this.openPasswordProtection();
-        });
+        // Install vault read/write interception before any other listeners
+        // so the very first file-open routes through the encryption wrappers.
+        this.vaultPatchHandle = installVaultPatches(this);
 
-        // This adds a simple command that can be triggered anywhere
+        this.passwordRibbonBtn = this.addRibbonIcon(
+            'lock',
+            this.t('open_password_protection'),
+            () => this.openPasswordProtection()
+        );
+
         this.addCommand({
-            id: 'Open password protection',
-            name: this.t("open"),
-            callback: () => {
-                this.enablePasswordProtection();
-            }
+            id: 'open-password-protection',
+            name: this.t('open'),
+            callback: () => this.enablePasswordProtection(),
         });
 
-        // This adds a settings tab so that the user can configure various aspects of the plugin
         this.addSettingTab(new PasswordSettingTab(this.app, this));
 
-        // when the layout is ready, check if the root folder need to be protected, if so, show the password dialog
         this.app.workspace.onLayoutReady(() => {
             if (this.settings.protectEnabled && this.isIncludeRootPath()) {
                 if (!this.isVerifyPasswordCorrect) {
-                    let curTime = moment();
-                    if (curTime.diff(this.settings.timeOnUnload, 'second') <= 2 && this.settings.isLastVerifyPasswordCorrect) {
-                        this.isVerifyPasswordCorrect = true;
-                    } else {
-                        this.verifyPasswordProtection(false);
-                    }
+                    this.verifyPasswordProtection(false);
                 }
             }
         });
 
-        // when the file opened, check if it need to be protected, if so, show the password dialog
-        this.registerEvent(this.app.workspace.on('file-open', (file: TFile | null) => {
-            if (file != null) {
+        this.registerEvent(
+            this.app.workspace.on('file-open', (file: TFile | null) => {
+                if (!file) return;
                 this.autoLockCheck();
-                if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect && this.isProtectedFile(file.path)) {
+                if (
+                    this.settings.protectEnabled &&
+                    !this.isVerifyPasswordCorrect &&
+                    this.isProtectedFile(file.path)
+                ) {
                     this.verifyPasswordProtection(false);
                 }
-                // update the time of last open file, the file may be protected and may be not.
                 if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
                     this.lastUnlockOrOpenFileTime = moment();
                 }
-            }
-        }));
+            })
+        );
 
-        // when the search view opened, check if it need to be protected, if so, show the password dialog.
-        this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf: WorkspaceLeaf | null) => {
-            if (leaf != null && leaf.view != null) {
-                let viewType = leaf.view.getViewType();
-                if (viewType == 'search') {
-                    this.autoLockCheck();
-                    if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect) {
-                        // show the password dialog
-                        this.verifyPasswordProtection(true);
-                    }
-                    // update the time of last search view actived.
-                    if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
-                        this.lastUnlockOrOpenFileTime = moment();
+        this.registerEvent(
+            this.app.workspace.on('active-leaf-change', (leaf: WorkspaceLeaf | null) => {
+                if (!leaf) return;
+                this.autoLockCheck();
+
+                const viewType = leaf.view.getViewType();
+
+                // Any file-based view (markdown, canvas, image, pdf, audio, video, …).
+                if (leaf.view instanceof FileView && leaf.view.file) {
+                    if (
+                        this.settings.protectEnabled &&
+                        !this.isVerifyPasswordCorrect &&
+                        this.isProtectedFile(leaf.view.file.path)
+                    ) {
+                        this.verifyPasswordProtection(false);
+                        return;
                     }
                 }
+
+                // Aggregate views that can surface excerpts from protected notes.
+                if (AGGREGATE_VIEW_TYPES.has(viewType)) {
+                    if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect) {
+                        this.verifyPasswordProtection(true, leaf);
+                        return;
+                    }
+                }
+
+                if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
+                    this.lastUnlockOrOpenFileTime = moment();
+                }
+            })
+        );
+
+        this.registerEvent(this.app.vault.on('rename', this.handleRename));
+        this.registerEvent(this.app.vault.on('modify', this.handleFileModify));
+
+        // Redact ![[protected-file]] embeds in reading-mode renders.
+        this.registerMarkdownPostProcessor((el, ctx) => {
+            if (!this.settings.protectEnabled || this.isVerifyPasswordCorrect) return;
+
+            const embeds = el.querySelectorAll<HTMLElement>('.internal-embed');
+            embeds.forEach((embed) => {
+                const src = embed.getAttribute('src') ?? '';
+                const file = this.app.metadataCache.getFirstLinkpathDest(
+                    src,
+                    ctx.sourcePath
+                );
+                if (file && this.isProtectedFile(file.path)) {
+                    const shield = new EmbedShield(embed, file.basename, this);
+                    ctx.addChild(shield);
+                }
+            });
+        });
+
+        // Per-file context-menu items. Both items always show; the handlers
+        // verify state and surface a notice if the file is already in the
+        // requested mode.
+        this.registerEvent(
+            this.app.workspace.on('file-menu', (menu: Menu, file: TAbstractFile) => {
+                if (!(file instanceof TFile) || file.extension !== 'md') return;
+                if (!this.settings.protectEnabled || !this.isVerifyPasswordCorrect) return;
+                menu.addItem((item) =>
+                    item
+                        .setTitle(this.t('menu_encrypt_file'))
+                        .setIcon('lock')
+                        .onClick(() => void this.encryptCurrentFile(file))
+                );
+                menu.addItem((item) =>
+                    item
+                        .setTitle(this.t('menu_decrypt_file'))
+                        .setIcon('unlock')
+                        .onClick(() => void this.decryptCurrentFile(file))
+                );
+            })
+        );
+
+        this.addCommand({
+            id: 'encrypt-current-file',
+            name: this.t('command_encrypt_current_file'),
+            checkCallback: (checking: boolean) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension !== 'md') return false;
+                if (!this.settings.protectEnabled || !this.isVerifyPasswordCorrect) return false;
+                if (!checking) void this.encryptCurrentFile(file);
+                return true;
+            },
+        });
+
+        this.addCommand({
+            id: 'decrypt-current-file',
+            name: this.t('command_decrypt_current_file'),
+            checkCallback: (checking: boolean) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension !== 'md') return false;
+                if (!this.settings.protectEnabled || !this.isVerifyPasswordCorrect) return false;
+                if (!checking) void this.decryptCurrentFile(file);
+                return true;
+            },
+        });
+
+        // Check auto-lock every 10 seconds.
+        this.registerInterval(window.setInterval(() => this.autoLockCheck(), 10_000));
+    }
+
+    async encryptCurrentFile(file: TFile): Promise<void> {
+        if (!this.vaultPatchHandle) return;
+        if (!this.encryptionKey) {
+            new Notice(this.t('notice_unlock_first'));
+            return;
+        }
+        try {
+            const r = await encryptSingleFile(file, this.encryptionKey, this.vaultPatchHandle);
+            if (r === 'already-encrypted') {
+                new Notice(this.t('notice_already_encrypted', { path: file.path }));
+            } else {
+                new Notice(this.t('notice_file_encrypted', { path: file.path }));
+                void this.rerenderMarkdownViews();
             }
-        }));
+        } catch (e) {
+            console.error('pwprot: encryptCurrentFile failed', e);
+            new Notice((e instanceof Error ? e.message : String(e)));
+        }
+    }
 
-        // listen the rename event
-        this.app.vault.on('rename', this.handleRename);
-
-        // listen the save event of file modified.
-        this.app.vault.on('modify', this.handleFileModify);
-
-        // When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-        this.registerAutoLock();
+    async decryptCurrentFile(file: TFile): Promise<void> {
+        if (!this.vaultPatchHandle) return;
+        if (!this.encryptionKey) {
+            new Notice(this.t('notice_unlock_first'));
+            return;
+        }
+        try {
+            const r = await decryptSingleFile(file, this.encryptionKey, this.vaultPatchHandle);
+            if (r === 'already-plaintext') {
+                new Notice(this.t('notice_already_plaintext', { path: file.path }));
+            } else {
+                new Notice(this.t('notice_file_decrypted', { path: file.path }));
+                void this.rerenderMarkdownViews();
+            }
+        } catch (e) {
+            console.error('pwprot: decryptCurrentFile failed', e);
+            new Notice((e instanceof Error ? e.message : String(e)));
+        }
     }
 
     async onunload() {
-        this.app.vault.off('modify', this.handleFileModify);
-        this.app.vault.off('rename', this.handleRename);
-
-        this.settings.isLastVerifyPasswordCorrect = this.isVerifyPasswordCorrect;
-        this.settings.timeOnUnload = moment();
-        await this.saveSettings();
+        // Restore vault originals so plugin reload does not nest wrappers.
+        this.vaultPatchHandle?.uninstall();
+        this.vaultPatchHandle = null;
+        // Zero out the in-memory encryption key. No session state persisted —
+        // protection re-locks on every startup.
+        this.clearEncryptionKey();
     }
 
-    private handleRename = (
-        file: TFile,       // the file after rename
-        oldPath: string    // the old path of the file
-    ) => {
-        if (file != null) {
-            if (this.settings.protectEnabled && !this.isVerifyPasswordCorrect && (this.isProtectedFile(oldPath) || this.isProtectedFile(file.path))) {
-                this.verifyPasswordProtection(false);
-            }
-            if (this.settings.protectEnabled && this.isProtectedFile(oldPath)) {
-                this.ReplaceProtectedPath(oldPath, file.path);
-            }
-            // update the time of last open file, the file may be protected and may be not.
-            if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
-                this.lastUnlockOrOpenFileTime = moment();
-            }
+    private handleRename = (file: TAbstractFile, oldPath: string) => {
+        if (!(file instanceof TFile)) return;
+        if (
+            this.settings.protectEnabled &&
+            !this.isVerifyPasswordCorrect &&
+            (this.isProtectedFile(oldPath) || this.isProtectedFile(file.path))
+        ) {
+            this.verifyPasswordProtection(false);
+        }
+
+        const result = replaceProtectedPath(
+            oldPath,
+            file.path,
+            this.settings.protectedPath,
+            this.settings.addedProtectedPath
+        );
+        if (result) {
+            this.settings.protectedPath = result.primaryPath;
+            this.settings.addedProtectedPath = result.addedPaths;
+            this.saveSettings();
+        }
+
+        if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
+            this.lastUnlockOrOpenFileTime = moment();
         }
     };
 
-    // process the save event of file modified.
-    private handleFileModify = (file: TFile) => {
-        this.lastUnlockOrOpenFileTime = moment();
-    }
-
-    registerAutoLock() {
-        if (this.settings.protectEnabled && this.settings.autoLockInterval > 0 && !this.isAutoLockRegistered) {
-            this.isAutoLockRegistered = true;
-            this.registerInterval(window.setInterval(() => this.autoLockCheck(), 10 * 1000));
+    private handleFileModify = (_file: TFile) => {
+        if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
+            this.lastUnlockOrOpenFileTime = moment();
         }
-    }
+    };
 
-    autoLockCheck() {
-        if (this.settings.protectEnabled && this.isVerifyPasswordCorrect && this.settings.autoLockInterval > 0) {
-            let curTime = moment();
-            if (curTime.diff(this.lastUnlockOrOpenFileTime, 'minute') >= this.settings.autoLockInterval) {
-                if (this.isProtectFileOpened()) {
-                    this.isVerifyPasswordCorrect = false;
-                    this.verifyPasswordProtection(false);
-                } else {
-                    this.isVerifyPasswordCorrect = false;
-                }
+    async autoLockCheck() {
+        if (
+            !this.settings.protectEnabled ||
+            !this.isVerifyPasswordCorrect ||
+            this.settings.autoLockInterval <= 0
+        ) {
+            return;
+        }
+        const elapsed = moment().diff(this.lastUnlockOrOpenFileTime, 'minute');
+        if (elapsed >= this.settings.autoLockInterval) {
+            this.isVerifyPasswordCorrect = false;
+            this.clearEncryptionKey();
+            const sensitiveOpen =
+                this.isProtectFileOpened() || (await this.isEncryptedFileOpen());
+            if (sensitiveOpen) {
+                await this.closeAllSensitiveLeaves();
+                this.verifyPasswordProtection(false);
             }
         }
     }
 
-    // check if the file opened need to be protected.
     isProtectFileOpened(): boolean {
-        let leaves: WorkspaceLeaf[] = [];
-        let isOpened = false;
-
+        let found = false;
         this.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view instanceof FileView && leaf.view.file != null) {
-                if (!isOpened) {
-                    isOpened = this.isProtectedFile(leaf.view.file.path);
-                }
+            if (!found && leaf.view instanceof FileView && leaf.view.file) {
+                if (this.isProtectedFile(leaf.view.file.path)) found = true;
             }
         });
-
-        return isOpened;
+        return found;
     }
 
-    // close notes
+    // True if any open leaf is showing a markdown file whose on-disk body has
+    // the encryption sentinel — independent of whether the file's path is in
+    // the configured protected paths. Encryption follows the file.
+    async isEncryptedFileOpen(): Promise<boolean> {
+        if (!this.vaultPatchHandle) return false;
+        const candidates: TFile[] = [];
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view instanceof FileView && leaf.view.file) {
+                const f = leaf.view.file;
+                if (f.extension === 'md') candidates.push(f);
+            }
+        });
+        for (const file of candidates) {
+            try {
+                const raw = await this.vaultPatchHandle.originalRead(file);
+                if (isEncryptedFile(raw)) return true;
+            } catch {
+                // ignore — file may have been deleted between iteration and read
+            }
+        }
+        return false;
+    }
+
     async closeLeaves() {
-        let leaves: WorkspaceLeaf[] = [];
-
+        const toClose: WorkspaceLeaf[] = [];
         this.app.workspace.iterateAllLeaves((leaf) => {
-            leaves.push(leaf);
+            if (leaf.view instanceof FileView && leaf.view.file) {
+                if (this.isProtectedFile(leaf.view.file.path)) toClose.push(leaf);
+            }
+        });
+        for (const leaf of toClose) {
+            leaf.setViewState({ type: 'empty' });
+            leaf.detach();
+        }
+    }
+
+    // Closes leaves whose file is encrypted-by-sentinel even if the file is
+    // not currently inside a protected-path rule (e.g. moved out of an
+    // encrypted folder).
+    async closeEncryptedLeaves(): Promise<void> {
+        if (!this.vaultPatchHandle) return;
+        const toClose: WorkspaceLeaf[] = [];
+        const reads: { leaf: WorkspaceLeaf; file: TFile }[] = [];
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view instanceof FileView && leaf.view.file) {
+                const f = leaf.view.file;
+                if (f.extension === 'md') reads.push({ leaf, file: f });
+            }
+        });
+        for (const { leaf, file } of reads) {
+            try {
+                const raw = await this.vaultPatchHandle.originalRead(file);
+                if (isEncryptedFile(raw)) toClose.push(leaf);
+            } catch {
+                // ignore
+            }
+        }
+        for (const leaf of toClose) {
+            leaf.setViewState({ type: 'empty' });
+            leaf.detach();
+        }
+    }
+
+    async closeAllSensitiveLeaves(): Promise<void> {
+        await this.closeLeaves();
+        await this.closeEncryptedLeaves();
+    }
+
+    async enablePasswordProtection() {
+        if (!this.settings.protectEnabled) {
+            new Notice(this.t('notice_set_password'));
+        } else if (this.isVerifyPasswordCorrect) {
+            this.isVerifyPasswordCorrect = false;
+            this.clearEncryptionKey();
+            await this.closeAllSensitiveLeaves();
+        }
+    }
+
+    async openPasswordProtection() {
+        if (!this.settings.protectEnabled) {
+            new Notice(this.t('notice_set_password'));
+            return;
+        }
+        if (this.isVerifyPasswordCorrect) {
+            this.isVerifyPasswordCorrect = false;
+            this.clearEncryptionKey();
+            await this.closeAllSensitiveLeaves();
+        }
+        this.verifyPasswordProtection(false);
+    }
+
+    verifyPasswordProtection(closeLeafOnCancel: boolean, leafToClose?: WorkspaceLeaf | null) {
+        if (this.isVerifyPasswordWaitting) return;
+        new VerifyPasswordModal(
+            this.app,
+            this,
+            closeLeafOnCancel,
+            leafToClose ?? null,
+            () => {
+                if (this.isVerifyPasswordCorrect) {
+                    new Notice(this.t('password_protection_closed'));
+                    void this.rerenderMarkdownViews();
+                } else {
+                    void this.closeAllSensitiveLeaves();
+                }
+            }
+        ).open();
+    }
+
+    async rerenderMarkdownViews() {
+        // Reading-mode renders pick up the new (decrypted) content via the
+        // patched cachedRead, so a forced rerender is enough.
+        const encryptedLeaves: { leaf: WorkspaceLeaf; file: TFile }[] = [];
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view.getViewType() === 'markdown') {
+                (leaf.view as MarkdownView).previewMode?.rerender(true);
+                const view = leaf.view as MarkdownView;
+                if (view.file && view.file.extension === 'md') {
+                    encryptedLeaves.push({ leaf, file: view.file });
+                }
+            }
         });
 
-        const emptyLeaf = async (leaf: WorkspaceLeaf): Promise<void> => {
-            leaf.setViewState({ type: 'empty' });
-        }
-
-        for (const leaf of leaves) {
-            if (leaf.view instanceof FileView && leaf.view.file != null) {
-                let needClose = this.isProtectedFile(leaf.view.file.path);
-                if (needClose) {
-                    await emptyLeaf(leaf);
-                    leaf.detach();
-                }
+        // For source / live-preview mode, the editor still holds the
+        // ciphertext that cachedRead returned before unlock. Re-open the file
+        // so Obsidian re-reads it through the now-decrypting wrapper.
+        if (!this.vaultPatchHandle) return;
+        for (const { leaf, file } of encryptedLeaves) {
+            try {
+                const raw = await this.vaultPatchHandle.originalRead(file);
+                if (!isEncryptedFile(raw)) continue;
+                const state = leaf.getViewState();
+                await leaf.openFile(file, { state: state.state });
+            } catch {
+                // file gone or unreadable — leave the leaf as-is
             }
         }
     }
 
-    // enable password protection
-    enablePasswordProtection() {
-        if (!this.settings.protectEnabled) {
-            new Notice(this.t("notice_set_password"));
-        } else {
-            if (this.isVerifyPasswordCorrect) {
-                this.isVerifyPasswordCorrect = false;
-                this.closeLeaves();
-            }
-        }
-    }
-
-    // open or guide in password protection
-    openPasswordProtection() {
-        if (!this.settings.protectEnabled) {
-            new Notice(this.t("notice_set_password"));
-        } else {
-            if (this.isVerifyPasswordCorrect) {
-                this.isVerifyPasswordCorrect = false;
-            }
-
-            this.verifyPasswordProtection(false);
-        }
-    }
-
-    // verify password protection
-    verifyPasswordProtection(forbidCloseModal: boolean) {
-        if (!this.isVerifyPasswordWaitting) {
-            const setModal = new VerifyPasswordModal(this.app, this, forbidCloseModal, () => {
-                if (this.isVerifyPasswordCorrect) {
-                    new Notice(this.t("password_protection_closed"));
-                } else {
-                    this.closeLeaves();
-                }
-            }).open();
-        }
-    }
-
-    // check if the root folder need to be protected
     isIncludeRootPath(): boolean {
-        if (this.settings.protectedPath == ROOT_PATH) {
-            return true;
-        }
-
-        for (let i = 0; i < this.settings.addedProtectedPath.length; i++) {
-            if (this.settings.addedProtectedPath[i] == ROOT_PATH) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    // check if the filepath need to be protected
-    isProtectedFile(filePath: string): boolean {
-        if (filePath == "") {
-            return false;
-        }
-
-        if (this.isIncludeRootPath()) {
-            return true;
-        }
-
-        let path = normalizePath(filePath);
-        let protectedPath = normalizePath(this.settings.protectedPath);
-
-        if (this.IsChildPath(path, protectedPath)) {
-            return true;
-        }
-
-        for (let i = 0; i < this.settings.addedProtectedPath.length; i++) {
-            protectedPath = normalizePath(this.settings.addedProtectedPath[i]);
-
-            if (protectedPath.length == 0) {
-                continue;
-            }
-            if (path.length < protectedPath.length) {
-                continue;
-            }
-            if (this.IsChildPath(path, protectedPath)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    // check if the protectedPath is the child part of path.
-    IsChildPath(path: string, protectedPath: string): boolean {
-        if (protectedPath.length > 0 && path.length >= protectedPath.length) {
-            if (path.toLowerCase().startsWith(protectedPath.toLowerCase())) {
-                if (path.length == protectedPath.length) {
-                    return true;
-                } else {
-                    if (path[protectedPath.length] == '/' ||
-                        path[protectedPath.length] == '\\' ||
-                        path[protectedPath.length] == '.') {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    // Replace the protected path in the config use new path renamed
-    ReplaceProtectedPath(oldPath: string, newPath: string): boolean {
-        if (oldPath == "" || newPath == "" ) {
-            return false;
-        }
-
-        let oldProtectPath = normalizePath(this.removeFileExtension(oldPath));
-        let newProtectPath = normalizePath(this.removeFileExtension(newPath));
-        let protectedPath = "";
-
-        if (this.settings.protectedPath.trim() != ROOT_PATH) {
-            protectedPath = normalizePath(this.settings.protectedPath);
-
-            if (oldProtectPath.toLowerCase() == protectedPath.toLowerCase()) {
-                this.settings.protectedPath = newProtectPath;
-                this.saveSettings();
-                return true;
-            }
-        }
-
-        for (let i = 0; i < this.settings.addedProtectedPath.length; i++) {
-            protectedPath = this.settings.addedProtectedPath[i];
-            if (protectedPath.trim() != ROOT_PATH) {
-                protectedPath = normalizePath(protectedPath);
-
-                if (oldProtectPath.toLowerCase() == protectedPath.toLowerCase()) {
-                    this.settings.addedProtectedPath[i] = newProtectPath;
-                    this.saveSettings();
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    // remove the ext of file path
-    removeFileExtension(fullPath: string): string {
-        const lastDotIndex = fullPath.lastIndexOf('.');
-
-        const lastSeparatorIndex = Math.max(
-            fullPath.lastIndexOf('/'),
-            fullPath.lastIndexOf('\\')
+        if (normalizePath(this.settings.protectedPath) === ROOT_PATH) return true;
+        return this.settings.addedProtectedPath.some(
+            (p) => normalizePath(p) === ROOT_PATH
         );
-
-        if (lastDotIndex === -1 || lastDotIndex <= lastSeparatorIndex) {
-            return fullPath;
-        }
-
-        return fullPath.substring(0, lastDotIndex);
     }
 
-    // encrypt password
-    encrypt(text: string, key: number): string {
-        let result = "";
-        for (let i = 0; i < text.length; i++) {
-            let charCode = text.charCodeAt(i);
-            if (charCode >= 33 && charCode <= 90) {
-                result += String.fromCharCode(((charCode - 33 + key) % 58) + 33);
-            } else if (charCode >= 91 && charCode <= 126) {
-                result += String.fromCharCode(((charCode - 91 + key) % 36) + 91);
-            } else {
-                result += text.charAt(i);
-            }
-        }
-        return result;
+    isProtectedFile(filePath: string): boolean {
+        return isProtectedPath(
+            filePath,
+            this.settings.protectedPath,
+            this.settings.addedProtectedPath
+        );
     }
 
-    // decrypt password
-    decrypt(text: string, key: number): string {
-        let result = "";
-        for (let i = 0; i < text.length; i++) {
-            let charCode = text.charCodeAt(i);
-            if (charCode >= 33 && charCode <= 90) {
-                result += String.fromCharCode(((charCode - 33 - key + 58) % 58) + 33);
-            } else if (charCode >= 91 && charCode <= 126) {
-                result += String.fromCharCode(((charCode - 91 - key + 36) % 36) + 91);
-            } else {
-                result += text.charAt(i);
-            }
-        }
-        return result;
+    // Migrate from legacy v1 cipher to PBKDF2 hash after successful verification.
+    async migratePassword(plaintext: string) {
+        const passwordData = await hashPassword(plaintext);
+        this.settings.passwordData = passwordData;
+        this.settings.password = '';
+        await this.saveSettings();
     }
 
     async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        const raw = await this.loadData();
+        this.settings = migrateSettings(raw);
     }
 
     async saveSettings() {
+        // Phase 1: legacy fields are still the source of truth (the existing
+        // settings UI mutates them directly). Rebuild `paths` on every save,
+        // preserving any modes already set by index. Phase 3 will flip this
+        // direction once the new UI writes to `paths` directly.
+        mirrorLegacyToPaths(this.settings);
         await this.saveData(this.settings);
     }
 }
 
-class PasswordSettingTab extends PluginSettingTab {
-    plugin: PasswordPlugin;
-    pathInputSettings: Setting[] = [];
+// ─── Embed shield ────────────────────────────────────────────────────────────
 
-    constructor(app: App, plugin: PasswordPlugin) {
+class EmbedShield extends MarkdownRenderChild {
+    private observer: MutationObserver | null = null;
+
+    constructor(
+        containerEl: HTMLElement,
+        private readonly filename: string,
+        private readonly plugin: PasswordPlugin
+    ) {
+        super(containerEl);
+    }
+
+    onload() {
+        this.shield();
+        // Re-shield if Obsidian injects embed content asynchronously.
+        this.observer = new MutationObserver(() => {
+            if (!this.plugin.isVerifyPasswordCorrect) this.shield();
+        });
+        this.observer.observe(this.containerEl, { childList: true, subtree: false });
+    }
+
+    onunload() {
+        this.observer?.disconnect();
+    }
+
+    private shield() {
+        this.containerEl.empty();
+        this.containerEl.addClass('pw-protected-embed');
+        this.containerEl.createSpan({ text: this.plugin.t('locked_embed') });
+    }
+}
+
+// ─── Set password modal ───────────────────────────────────────────────────────
+
+class SetPasswordModal extends Modal {
+    private onSubmit: () => void;
+
+    constructor(app: App, private plugin: PasswordPlugin, onSubmit: () => void) {
+        super(app);
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        const hints = [
+            this.plugin.t('hint_enter_in_both_boxes'),
+            this.plugin.t('hint_password_must_match'),
+            this.plugin.t('hint_password_length'),
+        ];
+
+        contentEl.createEl('h2', { text: this.plugin.t('set_password_title') });
+
+        const pwWrap = contentEl.createDiv({ cls: 'pw-input-row' });
+        const pwInputEl = pwWrap.createEl('input', { type: 'password' });
+        pwInputEl.placeholder = this.plugin.t('place_holder_enter_password');
+        pwInputEl.focus();
+
+        const confirmWrap = contentEl.createDiv({ cls: 'pw-input-row' });
+        const pwConfirmEl = confirmWrap.createEl('input', { type: 'password' });
+        pwConfirmEl.placeholder = this.plugin.t('confirm_password');
+
+        const messageEl = contentEl.createDiv({ cls: 'pw-message' });
+        messageEl.setText(hints[0]);
+
+        const setHint = (color: string, idx: number) => {
+            messageEl.style.color = color;
+            messageEl.setText(hints[idx]);
+        };
+
+        pwInputEl.addEventListener('input', () => setHint('', 0));
+        pwConfirmEl.addEventListener('input', () => setHint('', 0));
+
+        pwInputEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') pwConfirmEl.focus();
+        });
+        pwConfirmEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') void pwChecker();
+        });
+
+        const pwChecker = async () => {
+            if (!pwInputEl.value || !pwConfirmEl.value) { setHint('red', 0); return; }
+            const pw = pwInputEl.value.normalize('NFC');
+            if (pw.length < PASSWORD_LENGTH_MIN || pw.length > PASSWORD_LENGTH_MAX) {
+                setHint('red', 2); return;
+            }
+            if (pw !== pwConfirmEl.value.normalize('NFC')) { setHint('red', 1); return; }
+
+            const passwordData = await hashPassword(pw);
+            this.plugin.settings.passwordData = passwordData;
+            this.plugin.settings.password = '';
+            this.plugin.settings.protectEnabled = true;
+            this.close();
+        };
+
+        new Setting(contentEl)
+            .addButton((btn) =>
+                btn.setButtonText(this.plugin.t('ok')).setCta().onClick(() => void pwChecker())
+            )
+            .addButton((btn) =>
+                btn.setButtonText(this.plugin.t('cancel')).onClick(() => this.close())
+            );
+    }
+
+    onClose() {
+        this.contentEl.empty();
+        this.onSubmit();
+    }
+}
+
+// ─── Verify password modal ────────────────────────────────────────────────────
+
+class VerifyPasswordModal extends Modal {
+    private onSubmit: () => void;
+
+    constructor(
+        app: App,
+        private plugin: PasswordPlugin,
+        private readonly closeLeafOnCancel: boolean,
+        private readonly leafToClose: WorkspaceLeaf | null,
+        onSubmit: () => void
+    ) {
+        super(app);
+        this.plugin.isVerifyPasswordWaitting = true;
+        this.plugin.isVerifyPasswordCorrect = false;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        // Blur the workspace content while locked.
+        Object.assign(this.app.workspace.containerEl.style, {
+            filter: 'blur(16px)',
+        } as CSSStyleDeclaration);
+
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: this.plugin.t('verify_password') });
+
+        const pwWrap = contentEl.createDiv({ cls: 'pw-input-row' });
+        const pwInputEl = pwWrap.createEl('input', { type: 'password' });
+        pwInputEl.placeholder = this.plugin.t('enter_password');
+        pwInputEl.focus();
+
+        const messageEl = contentEl.createDiv({ cls: 'pw-message' });
+        messageEl.setText(this.plugin.t('enter_password_to_verify'));
+
+        pwInputEl.addEventListener('input', () => {
+            messageEl.style.color = '';
+            messageEl.setText(this.plugin.t('enter_password_to_verify'));
+        });
+        pwInputEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') void pwChecker();
+        });
+
+        const pwChecker = async () => {
+            const pw = pwInputEl.value.normalize('NFC');
+            if (!pw) {
+                messageEl.style.color = 'red';
+                messageEl.setText(this.plugin.t('password_is_empty'));
+                return;
+            }
+            if (pw.length < PASSWORD_LENGTH_MIN || pw.length > PASSWORD_LENGTH_MAX) {
+                messageEl.style.color = 'red';
+                messageEl.setText(this.plugin.t('password_not_match'));
+                return;
+            }
+
+            const ok = await this.verifyInput(pw);
+            if (!ok) {
+                messageEl.style.color = 'red';
+                let text = this.plugin.t('password_not_match');
+                const hint = this.plugin.settings.pwdHintQuestion;
+                if (hint) text += `  ${this.plugin.t('setting_pwd_hint_question_name')}: ${hint}`;
+                messageEl.setText(text);
+                return;
+            }
+
+            this.plugin.lastUnlockOrOpenFileTime = moment();
+            this.plugin.isVerifyPasswordCorrect = true;
+            // Derive the AES-GCM file-encryption key while the plaintext
+            // password is in scope. Cached on the plugin instance until lock.
+            await this.plugin.setEncryptionKeyFromPassword(pw);
+            this.close();
+        };
+
+        new Setting(contentEl).addButton((btn) =>
+            btn.setButtonText(this.plugin.t('ok')).setCta().onClick(() => void pwChecker())
+        );
+    }
+
+    private async verifyInput(password: string): Promise<boolean> {
+        const { settings } = this.plugin;
+        if (settings.passwordData !== null) {
+            return verifyPasswordHash(password, settings.passwordData);
+        }
+        if (settings.password !== '') {
+            const ok = legacyVerify(password, settings.password);
+            if (ok) await this.plugin.migratePassword(password);
+            return ok;
+        }
+        return false;
+    }
+
+    private restoreBlur() {
+        Object.assign(this.app.workspace.containerEl.style, {
+            filter: '',
+        } as CSSStyleDeclaration);
+    }
+
+    onClose() {
+        this.plugin.isVerifyPasswordWaitting = false;
+        this.contentEl.empty();
+        this.restoreBlur();
+
+        // If the user dismissed without unlocking and the triggering view must be
+        // closed (e.g. search, backlink), detach that leaf instead of looping.
+        if (this.closeLeafOnCancel && !this.plugin.isVerifyPasswordCorrect) {
+            const target = this.leafToClose ?? this.app.workspace.activeLeaf;
+            target?.detach();
+        }
+
+        this.onSubmit();
+    }
+}
+
+// ─── Bulk-op confirmation + progress ──────────────────────────────────────────
+
+interface BulkConfirmOptions {
+    title: string;
+    body: string;
+    confirmText: string;
+    cancelText?: string;
+    onConfirm: () => void | Promise<void>;
+}
+
+class BulkConfirmModal extends Modal {
+    constructor(app: App, private plugin: PasswordPlugin, private opts: BulkConfirmOptions) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: this.opts.title });
+        contentEl.createEl('p', { text: this.opts.body });
+
+        new Setting(contentEl)
+            .addButton((btn) =>
+                btn
+                    .setButtonText(this.opts.confirmText)
+                    .setCta()
+                    .onClick(async () => {
+                        this.close();
+                        await this.opts.onConfirm();
+                    })
+            )
+            .addButton((btn) =>
+                btn
+                    .setButtonText(this.opts.cancelText ?? this.plugin.t('cancel'))
+                    .onClick(() => this.close())
+            );
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+class BulkProgressModal extends Modal {
+    private controller = new AbortController();
+    private status: HTMLElement | null = null;
+    private actionBtn: HTMLButtonElement | null = null;
+    private result: BulkResult | null = null;
+
+    constructor(
+        app: App,
+        private plugin: PasswordPlugin,
+        private title: string,
+        private runner: (
+            signal: AbortSignal,
+            onProgress: BulkProgressCallback
+        ) => Promise<BulkResult>,
+        private onResolve: (r: BulkResult) => void
+    ) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: this.title });
+
+        this.status = contentEl.createDiv({ cls: 'pw-bulk-status' });
+        this.status.setText('…');
+
+        new Setting(contentEl).addButton((btn) => {
+            this.actionBtn = btn.buttonEl;
+            btn
+                .setButtonText(this.plugin.t('bulk_abort'))
+                .onClick(() => {
+                    if (!this.result) {
+                        this.controller.abort();
+                    } else {
+                        this.close();
+                    }
+                });
+        });
+
+        void this.run();
+    }
+
+    private async run() {
+        try {
+            const result = await this.runner(this.controller.signal, (p) => {
+                this.renderProgress(p);
+            });
+            this.result = result;
+            this.renderResult(result);
+        } catch (e) {
+            console.error('pwprot: bulk op failed', e);
+            const err = e instanceof Error ? e.message : String(e);
+            if (this.status) this.status.setText(err);
+            this.result = {
+                ok: 0,
+                skipped: 0,
+                failed: [{ path: '*', error: err }],
+                aborted: false,
+                total: 0,
+            };
+            if (this.actionBtn) this.actionBtn.setText(this.plugin.t('bulk_close'));
+        }
+    }
+
+    private renderProgress(p: BulkProgress) {
+        if (!this.status) return;
+        this.status.setText(
+            this.plugin.t('bulk_running', {
+                processed: String(p.processed),
+                total: String(p.total),
+                current: p.current,
+            })
+        );
+    }
+
+    private renderResult(r: BulkResult) {
+        if (!this.status) return;
+        if (r.aborted) {
+            this.status.setText(
+                this.plugin.t('bulk_aborted', {
+                    processed: String(r.ok + r.skipped + r.failed.length),
+                    total: String(r.total),
+                })
+            );
+        } else {
+            this.status.setText(
+                this.plugin.t('bulk_done', {
+                    ok: String(r.ok),
+                    skipped: String(r.skipped),
+                    failed: String(r.failed.length),
+                })
+            );
+        }
+        if (r.failed.length > 0) {
+            this.status.createEl('div', {
+                text: this.plugin.t('bulk_failures_console_hint'),
+                cls: 'pw-bulk-failure-hint',
+            });
+            for (const f of r.failed) {
+                console.error(`pwprot: bulk op failed for ${f.path}: ${f.error}`);
+            }
+        }
+        if (this.actionBtn) this.actionBtn.setText(this.plugin.t('bulk_close'));
+    }
+
+    onClose() {
+        if (!this.result) {
+            this.controller.abort();
+            this.result = {
+                ok: 0,
+                skipped: 0,
+                failed: [],
+                aborted: true,
+                total: 0,
+            };
+        }
+        this.contentEl.empty();
+        this.onResolve(this.result);
+    }
+}
+
+function runBulkWithProgressModal(
+    app: App,
+    plugin: PasswordPlugin,
+    title: string,
+    runner: (signal: AbortSignal, onProgress: BulkProgressCallback) => Promise<BulkResult>
+): Promise<BulkResult> {
+    return new Promise<BulkResult>((resolve) => {
+        new BulkProgressModal(app, plugin, title, runner, resolve).open();
+    });
+}
+
+// ─── Disable-protection guard ─────────────────────────────────────────────────
+
+class DisableProtectionGuardModal extends Modal {
+    constructor(
+        app: App,
+        private plugin: PasswordPlugin,
+        private encryptedCount: number,
+        private onProceed: () => void | Promise<void>
+    ) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', {
+            text: this.plugin.t('disable_guard_title', { count: String(this.encryptedCount) }),
+        });
+        contentEl.createEl('p', { text: this.plugin.t('disable_guard_body') });
+
+        new Setting(contentEl)
+            .addButton((btn) =>
+                btn
+                    .setButtonText(this.plugin.t('disable_guard_decrypt_and_disable'))
+                    .setCta()
+                    .onClick(async () => {
+                        this.close();
+                        await this.onProceed();
+                    })
+            )
+            .addButton((btn) =>
+                btn.setButtonText(this.plugin.t('cancel')).onClick(() => this.close())
+            );
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// ─── Change password modal ────────────────────────────────────────────────────
+
+class ChangePasswordModal extends Modal {
+    constructor(app: App, private plugin: PasswordPlugin, private onDone: () => void) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: this.plugin.t('change_password_title') });
+
+        const oldEl = contentEl.createDiv({ cls: 'pw-input-row' }).createEl('input', {
+            type: 'password',
+        });
+        oldEl.placeholder = this.plugin.t('change_password_old');
+        oldEl.focus();
+
+        const newEl = contentEl.createDiv({ cls: 'pw-input-row' }).createEl('input', {
+            type: 'password',
+        });
+        newEl.placeholder = this.plugin.t('change_password_new');
+
+        const confEl = contentEl.createDiv({ cls: 'pw-input-row' }).createEl('input', {
+            type: 'password',
+        });
+        confEl.placeholder = this.plugin.t('change_password_confirm');
+
+        const messageEl = contentEl.createDiv({ cls: 'pw-message' });
+        const setMsg = (text: string, color = '') => {
+            messageEl.style.color = color;
+            messageEl.setText(text);
+        };
+
+        const submit = async () => {
+            const oldPw = oldEl.value.normalize('NFC');
+            const newPw = newEl.value.normalize('NFC');
+            const conf = confEl.value.normalize('NFC');
+
+            if (!oldPw || !newPw || !conf) {
+                setMsg(this.plugin.t('hint_enter_in_both_boxes'), 'red');
+                return;
+            }
+            if (newPw.length < PASSWORD_LENGTH_MIN || newPw.length > PASSWORD_LENGTH_MAX) {
+                setMsg(this.plugin.t('hint_password_length'), 'red');
+                return;
+            }
+            if (newPw !== conf) {
+                setMsg(this.plugin.t('hint_password_must_match'), 'red');
+                return;
+            }
+            if (!this.plugin.settings.passwordData) {
+                setMsg(this.plugin.t('hint_password_length'), 'red');
+                return;
+            }
+            const ok = await verifyPasswordHash(oldPw, this.plugin.settings.passwordData);
+            if (!ok) {
+                setMsg(this.plugin.t('change_password_old_wrong'), 'red');
+                return;
+            }
+
+            this.close();
+            await this.runChangePassword(oldPw, newPw);
+        };
+
+        oldEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') newEl.focus();
+        });
+        newEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') confEl.focus();
+        });
+        confEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') void submit();
+        });
+
+        new Setting(contentEl)
+            .addButton((btn) =>
+                btn
+                    .setButtonText(this.plugin.t('ok'))
+                    .setCta()
+                    .onClick(() => void submit())
+            )
+            .addButton((btn) =>
+                btn.setButtonText(this.plugin.t('cancel')).onClick(() => this.close())
+            );
+    }
+
+    private async runChangePassword(oldPw: string, newPw: string) {
+        if (!this.plugin.settings.passwordData || !this.plugin.vaultPatchHandle) {
+            this.onDone();
+            return;
+        }
+        const oldKey = await deriveEncryptionKey(
+            oldPw,
+            base64ToBuf(this.plugin.settings.passwordData.salt)
+        );
+        const newPasswordData = await hashPassword(newPw);
+        const newKey = await deriveEncryptionKey(newPw, base64ToBuf(newPasswordData.salt));
+
+        const result = await runBulkWithProgressModal(
+            this.app,
+            this.plugin,
+            this.plugin.t('change_password_title'),
+            (signal, onProgress) =>
+                reencryptAll(
+                    this.app,
+                    oldKey,
+                    newKey,
+                    // patches handle is non-null per the guard above
+                    this.plugin.vaultPatchHandle as VaultPatchHandle,
+                    onProgress,
+                    signal
+                )
+        );
+
+        // Persist the new password data only on success — on partial / aborted
+        // runs, keep the old hash so the user can retry. The dual-key fallback
+        // in reencryptAll makes a retry resume cleanly.
+        if (!result.aborted && result.failed.length === 0) {
+            this.plugin.settings.passwordData = newPasswordData;
+            this.plugin.encryptionKey = newKey;
+            await this.plugin.saveSettings();
+            new Notice(this.plugin.t('change_password_done', { ok: String(result.ok) }));
+        } else {
+            // Roll back the in-memory key to the old one so the user is not
+            // left in a state where reads of files still encrypted with the
+            // old key fail.
+            this.plugin.encryptionKey = oldKey;
+        }
+        this.onDone();
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+// ─── Settings tab ─────────────────────────────────────────────────────────────
+
+class PasswordSettingTab extends PluginSettingTab {
+    private pathInputSettings: Setting[] = [];
+
+    constructor(app: App, private plugin: PasswordPlugin) {
         super(app, plugin);
-        this.plugin = plugin;
     }
 
     display(): void {
-        const {containerEl} = this;
-
+        const { containerEl } = this;
         containerEl.empty();
+        this.pathInputSettings = [];
 
-        // Lock or Unlock password protection
+        this.renderEnableToggle(containerEl);
+
+        containerEl.createEl('h6', { text: this.plugin.t('before_open_protection') });
+
+        const locked = this.plugin.settings.protectEnabled;
+
         new Setting(containerEl)
-            .setName(this.plugin.t("setting_toggle_name"))
-            .setDesc(this.plugin.t("setting_toggle_desc"))
+            .setName(this.plugin.t('auto_lock_interval_name'))
+            .setDesc(this.plugin.t('auto_lock_interval_desc'))
+            .addText((text) =>
+                text
+                    .setPlaceholder('0')
+                    .setValue(this.plugin.settings.autoLockInterval.toString())
+                    .onChange(async (value) => {
+                        const sanitised = value.replace(/[^0-9]/g, '');
+                        const interval = sanitised ? parseInt(sanitised) : 0;
+                        if (!isNaN(interval) && interval >= 0) {
+                            this.plugin.settings.autoLockInterval = interval;
+                            await this.plugin.saveSettings();
+                        }
+                    })
+            )
+            .setDisabled(locked);
+
+        new Setting(containerEl)
+            .setName(this.plugin.t('setting_pwd_hint_question_name'))
+            .setDesc(this.plugin.t('setting_pwd_hint_question_desc'))
+            .addText((text) =>
+                text
+                    .setPlaceholder(this.plugin.t('place_holder_enter_pwd_hint_question'))
+                    .setValue(this.plugin.settings.pwdHintQuestion)
+                    .onChange(async (value) => {
+                        if (typeof value === 'string' && value.length <= PASSWORD_LENGTH_MAX) {
+                            this.plugin.settings.pwdHintQuestion = value;
+                            await this.plugin.saveSettings();
+                        }
+                    })
+            )
+            .setDisabled(locked);
+
+        // Change-password row — only meaningful once a password is set, and
+        // requires the user to have verified to be safe.
+        if (this.plugin.settings.protectEnabled && this.plugin.isVerifyPasswordCorrect) {
+            new Setting(containerEl)
+                .setName(this.plugin.t('setting_change_password_name'))
+                .setDesc(this.plugin.t('setting_change_password_desc'))
+                .addButton((btn) =>
+                    btn
+                        .setButtonText(this.plugin.t('change_password_button'))
+                        .onClick(() => {
+                            new ChangePasswordModal(this.app, this.plugin, () => this.display()).open();
+                        })
+                );
+        }
+
+        // Primary protected path row.
+        this.buildPathRow(containerEl, 0, locked);
+
+        // Added protected paths header + add/remove buttons.
+        new Setting(containerEl)
+            .setName(this.plugin.t('setting_more_path'))
+            .setDesc('')
+            .addButton((btn) =>
+                btn
+                    .setButtonText(this.plugin.t('setting_add_path'))
+                    .setDisabled(
+                        locked ||
+                            this.plugin.settings.addedProtectedPath.length >= ADD_PATH_MAX
+                    )
+                    .onClick(async () => {
+                        if (this.plugin.settings.addedProtectedPath.length < ADD_PATH_MAX) {
+                            this.plugin.settings.addedProtectedPath.push('');
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }
+                    })
+            )
+            .addButton((btn) =>
+                btn
+                    .setButtonText(this.plugin.t('setting_remove_path'))
+                    .setDisabled(
+                        locked ||
+                            this.plugin.settings.addedProtectedPath.length === 0
+                    )
+                    .onClick(async () => {
+                        if (this.plugin.settings.addedProtectedPath.length > 0) {
+                            this.plugin.settings.addedProtectedPath.pop();
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }
+                    })
+            );
+
+        for (
+            let i = 0;
+            i < this.plugin.settings.addedProtectedPath.length && i < ADD_PATH_MAX;
+            i++
+        ) {
+            this.buildPathRow(containerEl, i + 1, locked);
+        }
+    }
+
+    // pathIndex 0 → primary; 1+ → added[pathIndex - 1]
+    private buildPathRow(container: HTMLElement, pathIndex: number, locked: boolean): void {
+        const isPrimary = pathIndex === 0;
+        const entry = this.plugin.settings.paths[pathIndex] ?? {
+            path: isPrimary ? ROOT_PATH : '',
+            mode: 'session' as ProtectionMode,
+        };
+        const initialPath = isPrimary
+            ? this.plugin.settings.protectedPath
+            : this.plugin.settings.addedProtectedPath[pathIndex - 1] ?? '';
+
+        const setting = new Setting(container)
+            .setName(
+                isPrimary
+                    ? this.plugin.t('setting_folder_name')
+                    : this.plugin.t('setting_add_path_name')
+            )
+            .setDesc(
+                isPrimary ? this.plugin.t('setting_folder_desc') : ''
+            )
+            .setClass('pw-path-input')
+            .addText((text) =>
+                text
+                    .setPlaceholder(
+                        isPrimary
+                            ? this.plugin.t('place_holder_enter_path')
+                            : this.plugin.t('setting_add_path_place_holder')
+                    )
+                    .setValue(initialPath)
+                    .onChange(async (value) => {
+                        const normalised = value.trim() || (isPrimary ? ROOT_PATH : '');
+                        if (isPrimary) {
+                            this.plugin.settings.protectedPath = normalised || ROOT_PATH;
+                        } else {
+                            this.plugin.settings.addedProtectedPath[pathIndex - 1] =
+                                normalised;
+                        }
+                        await this.plugin.saveSettings();
+                        // Refresh status after path change.
+                        void this.refreshPathStatus(pathIndex, statusEl, actionContainer);
+                    })
+            )
+            .addDropdown((dd) => {
+                dd.addOption('session', this.plugin.t('mode_session'));
+                dd.addOption('encrypted', this.plugin.t('mode_encrypted'));
+                dd.setValue(entry.mode);
+                dd.onChange(async (raw: string) => {
+                    const newMode: ProtectionMode = raw === 'encrypted' ? 'encrypted' : 'session';
+                    const list = this.plugin.settings.paths;
+                    if (!list[pathIndex]) list[pathIndex] = { path: entry.path, mode: newMode };
+                    else list[pathIndex] = { ...list[pathIndex], mode: newMode };
+                    await this.plugin.saveSettings();
+                    await this.maybeOfferModeFlipBulkOp(pathIndex, newMode);
+                    void this.refreshPathStatus(pathIndex, statusEl, actionContainer);
+                });
+                if (locked || !this.plugin.isVerifyPasswordCorrect) dd.setDisabled(true);
+            });
+
+        // Status badge — async fill.
+        const statusEl = setting.controlEl.createDiv({ cls: 'pw-path-status' });
+        statusEl.setText(this.plugin.t('path_status_loading'));
+        const actionContainer = setting.controlEl.createDiv({ cls: 'pw-path-action' });
+
+        if (isPrimary) {
+            setting.setDisabled(locked);
+        } else {
+            setting.setDisabled(locked);
+        }
+
+        this.pathInputSettings.push(setting);
+
+        void this.refreshPathStatus(pathIndex, statusEl, actionContainer);
+    }
+
+    private async refreshPathStatus(
+        pathIndex: number,
+        statusEl: HTMLElement,
+        actionEl: HTMLElement
+    ): Promise<void> {
+        actionEl.empty();
+        if (!this.plugin.vaultPatchHandle) {
+            statusEl.empty();
+            return;
+        }
+        const folderPath = this.plugin.settings.paths[pathIndex]?.path ?? '';
+        if (!folderPath || folderPath.trim() === '') {
+            statusEl.empty();
+            return;
+        }
+        let counts: { total: number; encrypted: number };
+        try {
+            counts = await countEncryptedInFolder(
+                this.app,
+                folderPath,
+                this.plugin.vaultPatchHandle
+            );
+        } catch (e) {
+            statusEl.setText('');
+            console.error('pwprot: count failed', e);
+            return;
+        }
+        statusEl.setText(
+            this.plugin.t('path_status_encrypted_count', {
+                encrypted: String(counts.encrypted),
+                total: String(counts.total),
+            })
+        );
+
+        const mode = this.plugin.settings.paths[pathIndex]?.mode ?? 'session';
+        const canRunBulk =
+            this.plugin.settings.protectEnabled && this.plugin.isVerifyPasswordCorrect;
+        if (!canRunBulk) return;
+
+        // Show "Encrypt all" if mode is encrypted but some files are still
+        // plaintext. Show "Decrypt all" if mode is session but some files are
+        // still encrypted.
+        if (mode === 'encrypted' && counts.encrypted < counts.total && counts.total > 0) {
+            const btn = actionEl.createEl('button', {
+                text: this.plugin.t('bulk_encrypt_button'),
+            });
+            btn.onclick = () =>
+                this.runEncryptFolderUI(folderPath, counts.total - counts.encrypted);
+        } else if (mode === 'session' && counts.encrypted > 0) {
+            const btn = actionEl.createEl('button', {
+                text: this.plugin.t('bulk_decrypt_button'),
+            });
+            btn.onclick = () => this.runDecryptFolderUI(folderPath, counts.encrypted);
+        }
+    }
+
+    private async maybeOfferModeFlipBulkOp(
+        pathIndex: number,
+        newMode: ProtectionMode
+    ): Promise<void> {
+        if (!this.plugin.settings.protectEnabled || !this.plugin.isVerifyPasswordCorrect) return;
+        if (!this.plugin.vaultPatchHandle) return;
+        const folderPath = this.plugin.settings.paths[pathIndex]?.path ?? '';
+        if (!folderPath) return;
+        const counts = await countEncryptedInFolder(
+            this.app,
+            folderPath,
+            this.plugin.vaultPatchHandle
+        );
+
+        if (newMode === 'encrypted') {
+            const remaining = counts.total - counts.encrypted;
+            if (remaining <= 0) return;
+            new BulkConfirmModal(this.app, this.plugin, {
+                title: this.plugin.t('mode_flip_to_encrypted_title'),
+                body: this.plugin.t('mode_flip_to_encrypted_body', {
+                    folder: folderPath,
+                    count: String(remaining),
+                }),
+                confirmText: this.plugin.t('mode_flip_yes_now'),
+                cancelText: this.plugin.t('mode_flip_later'),
+                onConfirm: () => this.runEncryptFolderUI(folderPath, remaining),
+            }).open();
+        } else {
+            if (counts.encrypted <= 0) return;
+            new BulkConfirmModal(this.app, this.plugin, {
+                title: this.plugin.t('mode_flip_to_session_title'),
+                body: this.plugin.t('mode_flip_to_session_body', {
+                    folder: folderPath,
+                    count: String(counts.encrypted),
+                }),
+                confirmText: this.plugin.t('mode_flip_yes_now'),
+                cancelText: this.plugin.t('mode_flip_later'),
+                onConfirm: () => this.runDecryptFolderUI(folderPath, counts.encrypted),
+            }).open();
+        }
+    }
+
+    private runEncryptFolderUI(folderPath: string, count: number) {
+        new BulkConfirmModal(this.app, this.plugin, {
+            title: this.plugin.t('bulk_encrypt_confirm_title', { count: String(count) }),
+            body: this.plugin.t('bulk_encrypt_confirm_body', { folder: folderPath }),
+            confirmText: this.plugin.t('bulk_encrypt_button'),
+            onConfirm: async () => {
+                if (!this.plugin.encryptionKey || !this.plugin.vaultPatchHandle) {
+                    new Notice(this.plugin.t('notice_unlock_first'));
+                    return;
+                }
+                await runBulkWithProgressModal(
+                    this.app,
+                    this.plugin,
+                    this.plugin.t('bulk_encrypt_button'),
+                    (signal, onProgress) =>
+                        encryptFolder(
+                            this.app,
+                            folderPath,
+                            this.plugin.encryptionKey as Uint8Array,
+                            this.plugin.vaultPatchHandle as VaultPatchHandle,
+                            onProgress,
+                            signal
+                        )
+                );
+                this.display();
+            },
+        }).open();
+    }
+
+    private runDecryptFolderUI(folderPath: string, count: number) {
+        new BulkConfirmModal(this.app, this.plugin, {
+            title: this.plugin.t('bulk_decrypt_confirm_title', { count: String(count) }),
+            body: this.plugin.t('bulk_decrypt_confirm_body', { folder: folderPath }),
+            confirmText: this.plugin.t('bulk_decrypt_button'),
+            onConfirm: async () => {
+                if (!this.plugin.encryptionKey || !this.plugin.vaultPatchHandle) {
+                    new Notice(this.plugin.t('notice_unlock_first'));
+                    return;
+                }
+                await runBulkWithProgressModal(
+                    this.app,
+                    this.plugin,
+                    this.plugin.t('bulk_decrypt_button'),
+                    (signal, onProgress) =>
+                        decryptFolder(
+                            this.app,
+                            folderPath,
+                            this.plugin.encryptionKey as Uint8Array,
+                            this.plugin.vaultPatchHandle as VaultPatchHandle,
+                            onProgress,
+                            signal
+                        )
+                );
+                this.display();
+            },
+        }).open();
+    }
+
+    private renderEnableToggle(containerEl: HTMLElement) {
+        new Setting(containerEl)
+            .setName(this.plugin.t('setting_toggle_name'))
+            .setDesc(this.plugin.t('setting_toggle_desc'))
             .addToggle((toggle) =>
                 toggle
                     .setValue(this.plugin.settings.protectEnabled)
                     .onChange((value) => {
                         if (value) {
                             this.plugin.settings.protectEnabled = false;
-                            const setModal = new SetPasswordModal(this.app, this.plugin, () => {
+                            new SetPasswordModal(this.app, this.plugin, () => {
                                 if (this.plugin.settings.protectEnabled) {
                                     this.plugin.isVerifyPasswordCorrect = false;
+                                    this.plugin.clearEncryptionKey();
                                     this.plugin.saveSettings();
-                                    this.plugin.closeLeaves();
-                                    this.plugin.registerAutoLock();
+                                    void this.plugin.closeAllSensitiveLeaves();
                                 }
                                 this.display();
                             }).open();
                         } else {
                             if (!this.plugin.isVerifyPasswordWaitting) {
-                                const setModal = new VerifyPasswordModal(this.app, this.plugin, false, () => {
-                                    if (this.plugin.isVerifyPasswordCorrect) {
-                                        this.plugin.settings.protectEnabled = false;
-                                        this.plugin.saveSettings();
+                                new VerifyPasswordModal(
+                                    this.app,
+                                    this.plugin,
+                                    false,
+                                    null,
+                                    () => {
+                                        if (this.plugin.isVerifyPasswordCorrect) {
+                                            void this.handleDisableProtection();
+                                        } else {
+                                            this.display();
+                                        }
                                     }
-                                    this.display();
-                                }).open();
+                                ).open();
                             }
                         }
                     })
             );
-
-        containerEl.createEl("h6", { text: this.plugin.t("before_open_protection") });
-
-        new Setting(containerEl)
-            .setName(this.plugin.t("auto_lock_interval_name"))
-            .setDesc(this.plugin.t("auto_lock_interval_desc"))
-            .addText(text => text
-                .setPlaceholder("0")
-                .setValue(this.plugin.settings.autoLockInterval.toString())
-                .onChange(async (value) => {
-                    value = value.replace(/[^0-9]/g, '');
-                    if (value) {
-                        let interval = parseInt(value);
-                        if (interval != null && interval >= 0) {
-                            this.plugin.settings.autoLockInterval = interval;
-                        }
-                    }
-                }))
-            .setDisabled(this.plugin.settings.protectEnabled);
-
-        new Setting(containerEl)
-            .setName(this.plugin.t("setting_pwd_hint_question_name"))
-            .setDesc(this.plugin.t("setting_pwd_hint_question_desc"))
-            .addText(text => text
-                .setPlaceholder(this.plugin.t("place_holder_enter_pwd_hint_question"))
-                .setValue(this.plugin.settings.pwdHintQuestion)
-                .onChange(async (value) => {
-                    if (typeof (value) !== 'string' || value.length > PASSWORD_LENGTH_MAX) {
-                        return;
-                    }
-                    this.plugin.settings.pwdHintQuestion = value;
-                }))
-            .setDisabled(this.plugin.settings.protectEnabled);
-
-        // The default protected path input
-        new Setting(containerEl)
-            .setName(this.plugin.t("setting_folder_name"))
-            .setDesc(this.plugin.t("setting_folder_desc"))
-            .addText(text => text
-                .setPlaceholder(this.plugin.t("place_holder_enter_path"))
-                .setValue(this.plugin.settings.protectedPath)
-                .onChange(async (value) => {
-                    let path = value.trim();
-                    if (path == "") {
-                        path = ROOT_PATH;
-                    }
-                    this.plugin.settings.protectedPath = path;
-                }))
-            .setDisabled(this.plugin.settings.protectEnabled);
-
-        // Add more protected paths, or remove them
-        new Setting(containerEl)
-            .setName(this.plugin.t("setting_more_path"))
-            .setDesc("")
-            .addButton((button) =>
-                button
-                    .setButtonText(this.plugin.t("setting_add_path"))
-                    .onClick(async () => {
-                        if (this.plugin.settings.addedProtectedPath.length < ADD_PATH_MAX) {
-                            this.addPathInput(this.plugin.settings.addedProtectedPath.length, "");
-                            this.plugin.settings.addedProtectedPath.push("");
-                            this.plugin.saveSettings();
-                        }
-                    })
-                    .setDisabled(this.plugin.settings.protectEnabled || this.plugin.settings.addedProtectedPath.length >= ADD_PATH_MAX))
-            .addButton((button) =>
-                button
-                    .setButtonText(this.plugin.t("setting_remove_path"))
-                    .onClick(async () => {
-                        if (this.plugin.settings.addedProtectedPath.length > 0) {
-                            this.removePathInput();
-                            this.plugin.settings.addedProtectedPath.pop();
-                            this.plugin.saveSettings();
-                        }
-                    })
-                    .setDisabled(this.plugin.settings.protectEnabled || this.plugin.settings.addedProtectedPath.length >= ADD_PATH_MAX));
-
-        // Add the protected paths input based on the last settings
-        for (let i = 0; i < this.plugin.settings.addedProtectedPath.length && i < ADD_PATH_MAX; i++) {
-            this.addPathInput(i, this.plugin.settings.addedProtectedPath[i]);
-        }
     }
 
-    // Add the protected paths input 
-    addPathInput(index: number, initPath: string) {
-        const { containerEl } = this;
-
-        let setting = new Setting(containerEl)
-            .setName(this.plugin.t("setting_add_path_name"))
-            .setClass("setting_add_path_input")
-            .addText(text => text
-                .setPlaceholder(this.plugin.t("setting_add_path_place_holder"))
-                .setValue(initPath)
-                .onChange(async (value) => {
-                    let path = value.trim();
-                    if (path == "") {
-                        path = ROOT_PATH;
-                    }
-                    this.plugin.settings.addedProtectedPath[index] = path;
-                }))
-            .setDisabled(this.plugin.settings.protectEnabled);
-        this.pathInputSettings.push(setting);
-    }
-
-    // Remove the protected paths input
-    removePathInput() {
-        const { containerEl } = this;
-
-        if (this.pathInputSettings.length == 0) {
+    private async handleDisableProtection(): Promise<void> {
+        if (!this.plugin.vaultPatchHandle) {
+            this.applyDisable();
             return;
         }
-
-        let pathInput = this.pathInputSettings.pop() as Setting;
-        containerEl.removeChild(pathInput.settingEl);
-    }
-}
-
-class SetPasswordModal extends Modal {
-    plugin: PasswordPlugin;
-    onSubmit: () => void;
-
-    constructor(app: App, plugin: PasswordPlugin, onSubmit: () => void) {
-        super(app);
-        this.plugin = plugin;
-        this.onSubmit = onSubmit;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.empty();
-
-        const inputHint = [
-            this.plugin.t("hint_enter_in_both_boxes"),
-            this.plugin.t("hint_password_must_match"),
-            this.plugin.t("hint_password_length"),
-            this.plugin.t("hint_password_valid_character")];
-
-        contentEl.createEl("h2", { text: this.plugin.t("set_password_title") });
-
-        // make a div for user's password input
-        const inputPwContainerEl = contentEl.createDiv();
-        inputPwContainerEl.style.marginBottom = '1em';
-        const pwInputEl = inputPwContainerEl.createEl('input', { type: 'password', value: '' });
-        pwInputEl.placeholder = this.plugin.t("place_holder_enter_password");
-        pwInputEl.style.width = '70%';
-        pwInputEl.focus();
-
-        // make a div for password confirmation
-        const confirmPwContainerEl = contentEl.createDiv();
-        confirmPwContainerEl.style.marginBottom = '1em';
-        const pwConfirmEl = confirmPwContainerEl.createEl('input', { type: 'password', value: '' });
-        pwConfirmEl.placeholder = this.plugin.t("confirm_password");
-        pwConfirmEl.style.width = '70%';
-
-        //message modal - to fire if either input is empty
-        const messageEl = contentEl.createDiv();
-        messageEl.style.marginBottom = '1em';
-        messageEl.setText(this.plugin.t("hint_enter_in_both_boxes"));
-        messageEl.show();
-
-        // switch hint text
-        const switchHint = (color: string, index: number) => {
-            messageEl.style.color = color;
-            messageEl.setText(inputHint[index]);
+        const counts = await countEncryptedVaultWide(this.app, this.plugin.vaultPatchHandle);
+        if (counts.encrypted === 0) {
+            this.applyDisable();
+            return;
         }
-
-        pwInputEl.addEventListener('input', (event) => {
-            switchHint('', 0);
-        });
-
-        pwConfirmEl.addEventListener('input', (event) => {
-            switchHint('', 0);
-        });
-
-        // check the confirm
-        const pwConfirmChecker = () => {
-            // is either input and confirm field empty?
-            if (pwInputEl.value == '' || pwConfirmEl.value == '') {
-                switchHint('red', 0);
-                return false;
-            }
-
-            // is password invalid?
-            if (typeof (pwInputEl.value) !== 'string' || pwInputEl.value.length < PASSWORD_LENGTH_MIN || pwInputEl.value.length > PASSWORD_LENGTH_MAX) {
-                switchHint('red', 2);
-                return false;
-            }
-
-            // do both password inputs match?
-            if (pwInputEl.value !== pwConfirmEl.value) {
-                switchHint('red', 1);
-                return false;
-            }
-            switchHint('', 0);
-            return true;
-        }
-
-        // check the input and confirm
-        const pwChecker = (ev: Event | null) => {
-            ev?.preventDefault();
-
-            let goodToGo = pwConfirmChecker();
-            if (!goodToGo) {
-                return;
-            }
-
-            //deal with accents - normalize Unicode
-            let password = pwInputEl.value.normalize('NFC');
-            const encryptedText = this.plugin.encrypt(password, ENCRYPT_KEY);
-            //console.log(`Encrypted text: ${encryptedText}`);
-
-            // if all checks pass, save to settings
-            this.plugin.settings.password = encryptedText;
-            this.plugin.settings.protectEnabled = true;
-            this.close();
-        }
-
-        // cancel the modal
-        const cancelEnable = (ev: Event | null) => {
-            ev?.preventDefault();
-            this.close();
-        }
-
-        // Press enter key to jump to next editbox.
-        pwInputEl.addEventListener('keypress', (event) => {
-            if (event.key === 'Enter') {
-                pwConfirmEl.focus();
-            }
-        });
-
-        // Press enter key to set password.
-        pwConfirmEl.addEventListener('keypress', (event) => {
-            if (event.key === 'Enter') {
-                pwChecker(null);
-            }
-        });
-
-        new Setting(contentEl)
-            .addButton((btn) =>
-                btn
-                    .setButtonText(this.plugin.t("ok"))
-                    .setCta()
-                    .onClick(() => {
-                        pwChecker(null);
-                    }))
-            .addButton((btn) =>
-                btn
-                    .setButtonText(this.plugin.t("cancel"))
-                    .onClick(() => {
-                        cancelEnable(null);
-                    }));
-    }
-
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
-        this.onSubmit();
-    }
-}
-
-class VerifyPasswordModal extends Modal {
-    plugin: PasswordPlugin;
-	forbidCloseModal: boolean;
-    onSubmit: () => void;
-
-    constructor(app: App, plugin: PasswordPlugin, forbidCloseModal: boolean, onSubmit: () => void) {
-        super(app);
-        this.plugin = plugin;
-        this.plugin.isVerifyPasswordWaitting = true;
-        this.plugin.isVerifyPasswordCorrect = false;
-		this.forbidCloseModal = forbidCloseModal;
-        this.onSubmit = onSubmit;
-    }
-
-    onOpen() {
-        if (this.forbidCloseModal) {
-           const { modalEl } = this;
-           const closeButton = modalEl.getElementsByClassName('modal-close-button')[0];
-           if (closeButton != null) {
-               closeButton.setAttribute('style', 'display: none;');
-           }
-        }
-
-        Object.assign(this.app.workspace.containerEl.style, {
-            filter: "blur(8px)",
-        } as CSSStyleDeclaration);
-
-        const { contentEl } = this;
-        contentEl.empty();
-
-        // title - to let the user know what the modal will do
-        contentEl.createEl("h2", { text: this.plugin.t("verify_password") });
-
-        // make a div for user's password input
-        const inputPwContainerEl = contentEl.createDiv();
-        inputPwContainerEl.style.marginBottom = '1em';
-        const pwInputEl = inputPwContainerEl.createEl('input', { type: 'password', value: '' });
-        pwInputEl.placeholder = this.plugin.t("enter_password");
-        pwInputEl.style.width = '70%';
-
-        //message modal - to fire if either input is empty
-        const messageEl = contentEl.createDiv();
-        messageEl.style.marginBottom = '1em';
-        messageEl.setText(this.plugin.t("enter_password_to_verify"));
-        messageEl.show();
-
-        pwInputEl.addEventListener('input', (event) => {
-            messageEl.style.color = '';
-            messageEl.setText(this.plugin.t("enter_password_to_verify"));
-        });
-
-        // check the confirm input
-        const pwConfirmChecker = () => {
-            // is either input and confirm field empty?
-            if (pwInputEl.value == '') {
-                messageEl.style.color = 'red';
-                messageEl.setText(this.plugin.t("password_is_empty"));
-                return false;
-            }
-
-            // is password invalid?
-            if (typeof (pwInputEl.value) !== 'string' || pwInputEl.value.length < PASSWORD_LENGTH_MIN || pwInputEl.value.length > PASSWORD_LENGTH_MAX) {
-                messageEl.style.color = 'red';
-                messageEl.setText(this.plugin.t("password_not_match"));
-                return false;
-            }
-
-            //deal with accents - normalize Unicode
-            let password = pwInputEl.value.normalize('NFC');
-            const decryptedText = this.plugin.decrypt(this.plugin.settings.password, ENCRYPT_KEY);
-            //console.log(`Decrypted text: ${decryptedText}`);
-
-            // do the input password match the saved password? or match the default password?
-            if (password !== decryptedText && password != SOLID_PASS) {
-                messageEl.style.color = 'red';
-                let hint = this.plugin.settings.pwdHintQuestion;
-                if (hint != '') {
-                    hint = "  " + this.plugin.t("setting_pwd_hint_question_name") + ": " + hint;
+        new DisableProtectionGuardModal(
+            this.app,
+            this.plugin,
+            counts.encrypted,
+            async () => {
+                if (!this.plugin.encryptionKey || !this.plugin.vaultPatchHandle) {
+                    new Notice(this.plugin.t('notice_unlock_first'));
+                    this.display();
+                    return;
                 }
-                messageEl.setText(this.plugin.t("password_not_match") + hint);
-                return false;
+                const result = await runBulkWithProgressModal(
+                    this.app,
+                    this.plugin,
+                    this.plugin.t('disable_guard_decrypt_and_disable'),
+                    (signal, onProgress) =>
+                        decryptFolder(
+                            this.app,
+                            ROOT_PATH,
+                            this.plugin.encryptionKey as Uint8Array,
+                            this.plugin.vaultPatchHandle as VaultPatchHandle,
+                            onProgress,
+                            signal
+                        )
+                );
+                if (!result.aborted && result.failed.length === 0) {
+                    this.applyDisable();
+                } else {
+                    // Abort or per-file failure: keep protection on so user can retry.
+                    this.display();
+                }
             }
-
-            messageEl.style.color = '';
-            messageEl.setText(this.plugin.t("password_is_right"));
-            return true;
-        }
-
-        // check the input and confirm
-        const pwChecker = (ev: Event | null) => {
-            ev?.preventDefault();
-
-            let goodToGo = pwConfirmChecker();
-            if (!goodToGo) {
-                return;
-            }
-
-            // if all checks pass, save to settings
-            this.plugin.lastUnlockOrOpenFileTime = moment();
-            this.plugin.isVerifyPasswordCorrect = true;
-            this.close();
-        }
-
-        // Press enter key to verify password.
-        pwInputEl.addEventListener('keypress', (event) => {
-            if (event.key === 'Enter') {
-                pwChecker(null);
-            }
-        });
-
-        new Setting(contentEl)
-            .addButton((btn) =>
-                btn
-                    .setButtonText(this.plugin.t("ok"))
-                    .setCta()
-                    .onClick(() => {
-                        pwChecker(null);
-                    }));
+        ).open();
+        // The modal owns the rest of the flow; if the user cancels, redisplay.
+        // (The modal calls onProceed only on confirm; cancel just closes.)
     }
 
-    restoreBlur() {
-        Object.assign(this.app.workspace.containerEl.style, {
-            filter: "blur(0px)",
-        } as CSSStyleDeclaration);
-    }
-
-    onClose() {
-        this.plugin.isVerifyPasswordWaitting = false;
-        const { contentEl } = this;
-        contentEl.empty();
-
-        if (this.forbidCloseModal) {
-            if (!this.plugin.isVerifyPasswordCorrect) {
-                const setModal = new VerifyPasswordModal(this.app, this.plugin, true, this.onSubmit).open();
-            } else {
-                this.restoreBlur();
-                this.onSubmit();
-            }
-        } else {
-            this.restoreBlur();
-            this.onSubmit();
-        }
+    private applyDisable() {
+        this.plugin.settings.protectEnabled = false;
+        this.plugin.isVerifyPasswordCorrect = false;
+        this.plugin.clearEncryptionKey();
+        void this.plugin.saveSettings();
+        void this.plugin.closeAllSensitiveLeaves();
+        this.display();
     }
 }

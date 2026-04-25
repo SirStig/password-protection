@@ -1,136 +1,182 @@
-English | [中文](#中文版说明)  
+English | [中文](#中文版说明)
 
-![Obsidian Downloads](https://img.shields.io/badge/dynamic/json?logo=obsidian&color=%23483699&label=downloads&query=%24%5B%22password-protection%22%5D.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json)  
+---
 
-------  
+# Noteguard
 
-# Obsidian Password Protection Plugin
+> Obsidian plugin: lock notes and folders with a password, with optional real at-rest AES-GCM encryption per path.
+>
+> Fork of [`qing3962/password-protection`](https://github.com/qing3962/password-protection) with the encryption pipeline, bulk operations, and change-password rekey added.
 
-## Purpose
+Choose **Session mode** for a cheap UI lock or **Encrypted mode** for real at-rest AES-GCM encryption — set per-path, mix and match.
 
-I developed this plugin for the Obsidian to prevent my girlfriend from peeking at my private notes/diaries in Obsidian.  
+## What it does
 
-## What does this plugin do?
+- Password-gates any folder or individual note path inside your vault, with two modes per path:
+  - **Session mode**: files stay plaintext on disk; the plugin only locks the Obsidian UI. Search and graph still work while locked. Cheap, no data-loss risk.
+  - **Encrypted mode**: files are written as AES-GCM ciphertext on disk inside a clearly-marked sentinel block. Decryption happens transparently while the vault is unlocked.
+- Blurs the workspace and prompts for a password when a protected note is about to open.
+- Redacts `![[embedded]]` transclusions of protected files in reading mode.
+- Auto-locks after a configurable idle interval; the in-memory encryption key is zeroed on every lock.
+- Blocks search, backlinks, and outgoing-link panes until unlocked when protection is active.
+- Bulk encrypt or decrypt every Markdown file under any protected path, with progress and a resumable (per-file) commit model.
+- Per-file **Encrypt this file** / **Decrypt this file** commands and right-click items.
+- Change-password flow re-encrypts every encrypted file with the new password (idempotent across crashes).
+- Password stored as a PBKDF2 + SHA-256 hash with a random 16-byte salt; the encryption key is HMAC-derived from the same PBKDF2 output via a separate domain so the on-disk verification hash and the in-memory encryption key are different bytes.
 
-No encrypt, no decrypt. This plugin doesn't modify your notes, it only lock the Obsidian and ask password to unlock.  
+## Encrypted mode
+
+Each protected path has a **mode** dropdown: `Session` or `Encrypted`. The mode dictates the *default for new files* added to that folder. Encryption status of an *existing* file lives in its on-disk sentinel header — so a file moved out of an encrypted folder stays encrypted until you explicitly decrypt it.
+
+An encrypted Markdown file looks like this on disk:
+
+```
+> [!warning] Password Protection — encrypted note
+> This file is encrypted by the **Password Protection** Obsidian plugin.
+> Do not edit it in another editor or it will become unreadable.
+> Open it in Obsidian and unlock to view its contents.
+
+```pwprot-v1
+<base64 envelope: salt + iv + AES-GCM ciphertext>
+```
+```
+
+Each save uses a fresh random IV; tampering or wrong-password decryption attempts surface as `auth-failed` and the file is left untouched.
+
+### Honest limits of encrypted mode
+
+- **Lost password = lost data.** There is no backdoor by design.
+- **Search / quick-switcher / backlinks do not match plaintext** of encrypted files, even when unlocked. Obsidian's metadata cache is built from on-disk bytes; the public API has no hook for injecting decrypted text into the cache.
+- **Sync diffs are noisy.** Every save changes the IV, so every byte of the envelope changes — Obsidian Sync sees a fresh write each time.
+- **Files moved into an encrypted folder are not retroactively encrypted.** Use right-click → Encrypt this file (or settings → Encrypt all) to opt them in.
+
+## Security model and honest limitations
+
+**Session mode** protects against casual access inside the Obsidian UI on the device where the plugin is running — e.g. someone picking up your phone or sitting at your desk while Obsidian is open. It does *not* protect note bytes from anyone with file-system access.
+
+**Encrypted mode** protects note bytes at rest:
+
+| Vector | Session mode | Encrypted mode |
+|--------|--------------|----------------|
+| Reading `.md` files directly via a file manager, terminal, or another editor | Not protected | Protected — files are AES-GCM ciphertext |
+| Obsidian Sync to another device / cloud copy | Note content visible to anyone with file access | Note content is ciphertext until unlocked on a device with the same password |
+| Graph view node titles | File names visible | File names visible (plaintext on disk) |
+| Hover preview popups (within Obsidian) | May briefly show content before the guard fires | Show ciphertext / decrypted text per current lock state |
+| Lost password recovery | Possible — files are plaintext | **Impossible** — no backdoor |
+
+## Upgrading from v1.x
+
+Your existing password is automatically migrated to the new secure hash format the first time you enter it after upgrading. You do not need to reset your password.
 
 ## Settings
 
-- "Enable/Disable password protection": you may set your password or use your password to enable/disable lock protection.
-- "Auto-lock": Specify a number of minutes for auto-locking obsidian since the last right password is typed.
-- "Password prompt": Please type a question to help you remember your password.
-- "Protected folder or file": You may type a path for protecting, if you use the '/', the entire vault will be protected.
-- "More folders or files": Add more paths to be protected, e.g. 'mynotes/diarys', up to 6.
+| Setting | Description |
+|---------|-------------|
+| Enable/Disable password protection | Toggle protection on (sets a new password) or off (requires current password and decryption of any encrypted files). |
+| Auto-lock | Minutes of inactivity before the vault re-locks. `0` disables auto-lock. |
+| Password prompt | An optional hint question shown when the password is wrong. |
+| Change password | Re-encrypts every encrypted file with the new password. Idempotent across crashes (re-run with the same new password to resume). |
+| Protected folder or file | Primary path to protect. Default `/` protects the entire vault. Pick **Session** or **Encrypted** mode per path. |
+| More folders or files | Up to 6 additional paths, each with its own mode. |
+| Encrypt all / Decrypt all | Per-row bulk button to convert every existing file under that path to/from ciphertext. |
 
-## Changelog
+## Usage
 
-- version 1.1.27 (1/1/2025)
+1. Open **Settings → Password Protection** and set a path and password.
+2. Enable protection with the toggle.
+3. The lock icon in the ribbon manually re-locks the vault.
+4. Use the **Lock** command from the command palette to lock at any time.
 
-1. Support adding more protected path.
+## Known bypass vectors (best-effort mitigations)
 
-2. Support type filepath protected.
+- **Graph view** — file names are visible as graph nodes. Clicking a node fires the password prompt before the note opens.
+- **Drag-and-drop** — dropping a protected file into the editor triggers the same `file-open` handler as a normal click and will prompt for the password. An extremely rapid drop before the event fires could briefly show content; the guard closes the leaf immediately after.
+- **Hover previews** — Obsidian renders link-hover popups outside the standard markdown pipeline. This is a known gap; avoid hovering over links to protected files while locked.
+- **Quick Switcher / file URI** — `file-open` fires for all these entry points; protection applies.
 
-- version 1.1.12 (8/16/2023)
+## Installation
 
-1. Add the interval setting of Auto-lock password protection. If you set a value greater than 0, when time elapse certain minutes from last unlocked protection or last opened a protected file，the password verify box will pop up again as soon as you open a new protected file.  
+Install from the Obsidian Community Plugin browser, or manually:
 
-## The systems have been tested:
-
-I have tested the plugin on Windows and iOS (iPhone, iPad) with Obsidian 2023.5.
-
-## Installation, Configuration, and Usage
-
-If you can't install the plugin from the community plugin market, you can try this:
- 
-1. Download the latest release: password-protection-1.x.x.zip, this package in cross-platform have been tested in Windows and iOS; [Download](https://github.com/qing3962/password-protection/releases).
-
-2. Open the folder for community plugins of Obsidian, usually locate in .obsidian/plugins of the your vault folder.
-
-3. Unzip the release zip, a new folder appear named "password-protection", two files in the folder: main.js, manifest.json.
-
-4. Relaunch Obsidian, click "Settings", choice "Community Plugins", you can see the "Password Protection" in installed plugins list, enable the plugin.
-
-5. See the left-down part of the Settings, the “Password Protection” will appear, click it, the setting page of the plugin is opened, type the path you want to protect, default path is root path.
-
-6. Enable the button of password protection, a Password Input Modal will popup, enter your password, click "OK".
-
-7. The password protection plugin start working, when you open a note in the protected path you set, a Password Verify Modal will popup, enter the right password, you just open the note.  
+1. Download the latest release zip and unzip it into `.obsidian/plugins/password-protection/`.
+2. The folder should contain `main.js`, `manifest.json`, and `styles.css`.
+3. Restart Obsidian, go to Settings → Community Plugins, and enable **Password Protection**.
 
 ## Contributing
 
-Contributions to the password-protection plugin are welcome!  
+Bug reports and pull requests are welcome at the [GitHub repository](https://github.com/qing3962/password-protection/issues).
 
-1. If you find any bugs or have any suggestions, please [open an issue](https://github.com/qing3962/password-protection/issues) or submit a pull request.  
+To add a new language, copy `langs/en.json`, translate the values, and submit a PR.
 
-2. If you want to display your own native language in the plugin, please refer to the ./langs/en.json file in the source code, create a new language file, and then open an issue attached the file or submit a pull request.  
+## Changelog
+
+### v3.0.0
+
+- **Rebrand**: Renamed from "Password Protection" to **Noteguard**. Plugin id changed to `noteguard`.
+- **Feature**: Per-path **Encrypted mode** — files are written as AES-GCM ciphertext on disk (sentinel-marked Markdown), transparently decrypted on read while unlocked. Lost password = lost data, by design.
+- **Feature**: Bulk encrypt / decrypt for any protected folder, with progress, abort, and per-file resumable commits.
+- **Feature**: Right-click → **Encrypt this file** / **Decrypt this file** plus matching command-palette commands.
+- **Feature**: Change-password flow re-encrypts every encrypted file with the new password; idempotent if interrupted (re-run with the same new password).
+- **Feature**: Disable-protection guard — toggling protection off while encrypted files exist now requires decrypting them first, preventing accidental lockout.
+- **Security**: AES-GCM keys are HMAC-derived from PBKDF2 output via a separate domain, so the verification hash on disk and the encryption key in memory are different bytes — neither is computable from the other without the password.
+- **Settings**: New v3 schema (`paths` array with per-entry mode); existing v2 settings migrate automatically with all paths in `session` mode.
+- **i18n**: Added 30+ new strings for the encryption UI (English; other locales fall back automatically).
+
+### v2.0.0
+
+- **Security**: Removed hardcoded master bypass password (`SOLID_PASS`).
+- **Security**: Password storage replaced with PBKDF2/SHA-256 (200,000 iterations, random 16-byte salt). Old passwords migrate automatically on first login.
+- **Security**: Removed the 2-second "same restart" session carry-over that allowed bypassing the lock after a quick restart.
+- **Fix**: Extra protected paths were silently ignored if more than 6 were saved — now correctly truncated.
+- **Fix**: Embed redaction — `![[protected-note]]` transclusions are now replaced with a locked placeholder in reading mode; Obsidian's async embed loader is watched and re-shielded.
+- **Fix**: Broader workspace coverage — `active-leaf-change` now guards all `FileView` subtypes (canvas, PDF, image, audio, video) in addition to markdown notes, plus search, backlinks, and outgoing-link panes.
+- **Fix**: When cancelling the password modal on a protected aggregate view (search, etc.), that leaf is now closed rather than re-opening the modal in an infinite loop.
+- **Fix**: Re-renders open markdown views after a successful unlock so embedded content appears without requiring navigation away and back.
+- **Tooling**: Updated to TypeScript 5.5, esbuild 0.25, Node types 22; `minAppVersion` set to 1.4.0.
+
+### v1.1.27 (2025-01-01)
+Support for multiple protected paths and individual file path protection.
+
+### v1.1.12 (2023-08-16)
+Auto-lock interval setting.
+
+## Credits
+
+Based on [`qing3962/password-protection`](https://github.com/qing3962/password-protection) (MIT). The original session-lock plumbing, embed redaction, and i18n scaffolding are upstream; the Noteguard fork adds the encryption pipeline, vault read/write interception, bulk operations, and change-password rekey.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT License](LICENSE) — original copyright Qing Li (2023), fork copyright SirStig (2026).
 
-------  
+---
 
 # 中文版说明
 
-## 目的
+## 用途
 
-我开发这个插件的目的是，防止我的女朋友偷看 Obsidian 中我的私人笔记或日记。  
+本插件不加密、不解密笔记，仅通过密码锁定 Obsidian 界面，防止他人在 Obsidian 中查看私人笔记。
 
-## 这个插件做了什么？
+## 安全模型说明
 
-这个插件不会加密和解密你的笔记，也不会修改你的笔记，它只会用弹出密码验证框的形式锁定Obsidian。  
+本插件**只保护 Obsidian 界面内**的访问行为，例如防止他人拿起你的手机或在你的桌面前打开受保护的笔记。
 
-## 设置
+**以下情况不受保护：**
+- 通过文件管理器、终端或其他编辑器直接读取 `.md` 文件（文件以明文存储在磁盘）
+- Obsidian Sync — 笔记文件照常同步，在其他已同步设备上以明文存在；插件设置（含密码哈希）也会同步，因此同一密码可在所有设备上使用
+- 图谱视图中的文件名仍然可见
+- 悬停预览弹窗可能短暂显示受保护笔记的内容
 
-- "开启或关闭密码保护": 这是一个开关，可以打开或关闭密码保护，会弹出密码输入框让你设置或验证密码.
-- "自动开启密码保护的间隔时间": 一段时间后自动打开密码保护。时间从上次关闭密码保护或上次打开一个受保护的文件开始计算，0 代表不自动开启密码保护, 单位：分钟.
-- "密码提示问题": 如果设置了这一项，当你忘记密码时，可以帮助你回忆起你的密码.
-- "需要保护的文件夹或文件": 输入一个要保护的路径，可以是文件或文件夹，如果用默认值 '/'，代表保护整个笔记库，打开被保护的文件需要输入一次密码.
-- "更多需要保护的文件夹或文件": 添加更多需要保护的路径, 例如：“我的笔记/日记”, 最多可以添加6条.
+## 从 v1.x 升级
 
-## 新功能  
-
-- 版本: 1.1.12 (2023.8.16)
-
-1. 增加自动打开密码保护的间隔时间设置，单位：分钟。如果设置的时间大于0，当距离上次关闭密码保护或上次打开一个被保护的文件，过去了设置的时间，插件将自动再次打开密码保护，如果用户再次打开一个受保护的文件，将弹出密码验证框验证密码。  
-
-## 已测试的系统
-
-这个插件已经在 Windows 和 iOS (iPhone、iPad) 系统上通过测试，使用2023年5月下载的 Obsidian。  
+首次升级后输入旧密码时，密码将自动迁移到新的安全存储格式，无需重置密码。
 
 ## 安装、配置和使用
 
-如果你不能从社区插件市场安装这个插件，你可以用下面的方法：
-
-1. 下载这个插件的最新 Release 版本: password-protection-1.x.x.zip，这个包可以跨平台使用，已经在 Windows 和 iOS 上完成测试； [GitHub](https://github.com/qing3962/password-protection/releases)  
-[Gitee](https://gitee.com/qing3962/password-protection/)
-
-2. 找到你的 Obsidian 配置文件夹的插件文件夹：plugins，一般在你的笔记库所在的目录：.obsidian/plugins；
-
-3. 在插件文件夹中，解压这个插件 zip 包，得到一个目录：.obsidian/plugins/password-protection，里面有两个文件: main.js 和 manifest.json；
-
-4. 重新启动 Obsidian，在 Settings 中选择“第三方插件”，在右侧下方的“已安装插件”中，可以看到 Password Protection，点击右侧的启用按钮；
-
-5. 在 Settings 中左侧下方“第三方插件”列表中，可以看到“Password Protection”，点击后右侧打开插件设置页面，设置一个要保护的路径，默认是根路径（/）；
-
-6. 点击插件的启用按钮，弹出密码设置框，输入两遍密码，插件启用成功;
-
-7. 当你打开一个位于保护路径下的笔记，将弹出密码验证弹窗，只有输入正确的密码，你才能继续打开笔记。  
-
-## 贡献和帮助
-
-欢迎你对这个插件做出贡献!  
-
-1. 如果你发现任何 Bug 或者有任何建议，请[创建一个 issue 在 GitHub](https://github.com/qing3962/password-protection/issues)，或者 fork 代码仓库修改后提交一个 pull request，或者发送邮件给我：qing3962@sina.com.  
+1. 从社区插件市场安装，或手动将 `main.js`、`manifest.json`、`styles.css` 放入 `.obsidian/plugins/password-protection/`；
+2. 在设置页设置要保护的路径和密码，启用密码保护开关；
+3. 左侧栏的锁形图标可随时手动锁定保险库；
+4. 命令面板中也有"Lock"命令可用。
 
 ## 许可证
 
-本插件使用 MIT 许可证： [MIT License](LICENSE)
-
-------  
-
-![Obsidian Downloads](https://img.shields.io/badge/dynamic/json?logo=obsidian&color=%23483699&label=downloads&query=%24%5B%22password-protection%22%5D.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json)  
-
-------  
-
-<a href="https://bmc.link/qing3962">Buy me a coffee?</a>  
+[MIT License](LICENSE)

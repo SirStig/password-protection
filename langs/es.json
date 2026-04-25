@@ -36,5 +36,8 @@
   "setting_add_path": "Añadir ruta protegida",
   "setting_add_path_name": "Ruta protegida",
   "setting_add_path_place_holder": "Introduzca la ruta, p. ej. Misnotas/diario",
-  "setting_remove_path": "Eliminar ruta protegida"
+  "setting_remove_path": "Eliminar ruta protegida",
+  "locked_embed": "🔒 Contenido protegido — desbloquea para ver",
+  "notice_locked_write_blocked": "Este archivo está cifrado y la bóveda está bloqueada. Desbloquea primero para editarlo.",
+  "notice_decrypt_failed": "No se pudo descifrar {{path}}. El archivo puede estar dañado o cifrado con otra contraseña."
 }

@@ -35,5 +35,8 @@
   "setting_add_path": "添加保护路径",
   "setting_add_path_name": "保护路径",
   "setting_add_path_place_holder": "输入路径，比如：我的笔记/日记",
-  "setting_remove_path": "移除保护路径"
+  "setting_remove_path": "移除保护路径",
+  "locked_embed": "🔒 受保护的内容 — 解锁后查看",
+  "notice_locked_write_blocked": "此文件已加密且密码保护处于锁定状态，请先解锁再编辑。",
+  "notice_decrypt_failed": "无法解密 {{path}}。文件可能已损坏或使用了其他密码加密。"
 }
