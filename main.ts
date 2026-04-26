@@ -26,15 +26,16 @@ import {
 } from './src/crypto';
 import {
     ROOT_PATH,
-    ADD_PATH_MAX,
-    isProtectedPath,
-    replaceProtectedPath,
+    isProtectedByEntries,
+    anyEntryIsRoot,
+    replaceProtectedPathInEntries,
 } from './src/path-utils';
 import {
     PasswordPluginSettings,
     migrateSettings,
-    mirrorLegacyToPaths,
+    mirrorPathsToLegacy,
 } from './src/settings';
+import { PathPickerModal } from './src/path-picker';
 import { isEncryptedFile } from './src/encryption';
 import { installVaultPatches, VaultPatchHandle } from './src/vault-patch';
 import {
@@ -49,7 +50,7 @@ import {
     encryptSingleFile,
     reencryptAll,
 } from './src/bulk-ops';
-import { ProtectionMode } from './src/path-utils';
+import { ProtectionMode, ProtectedPathEntry } from './src/path-utils';
 
 const PASSWORD_LENGTH_MIN = 1;
 const PASSWORD_LENGTH_MAX = 20;
@@ -99,16 +100,6 @@ export default class PasswordPlugin extends Plugin {
         await this.loadSettings();
 
         this.lastUnlockOrOpenFileTime = moment();
-
-        this.settings.protectedPath = this.settings.protectedPath.trim() || ROOT_PATH;
-
-        // Fix: the original code called .slice() without assigning the result.
-        if (this.settings.addedProtectedPath.length > ADD_PATH_MAX) {
-            this.settings.addedProtectedPath = this.settings.addedProtectedPath.slice(0, ADD_PATH_MAX);
-        }
-        this.settings.addedProtectedPath = this.settings.addedProtectedPath.filter(
-            (s) => s.trim() !== ''
-        );
 
         this.i18n = new I18n(this.settings.lang, async (lang: LangTypeAndAuto) => {
             this.settings.lang = lang;
@@ -321,16 +312,10 @@ export default class PasswordPlugin extends Plugin {
             this.verifyPasswordProtection(false);
         }
 
-        const result = replaceProtectedPath(
-            oldPath,
-            file.path,
-            this.settings.protectedPath,
-            this.settings.addedProtectedPath
-        );
-        if (result) {
-            this.settings.protectedPath = result.primaryPath;
-            this.settings.addedProtectedPath = result.addedPaths;
-            this.saveSettings();
+        const updated = replaceProtectedPathInEntries(oldPath, file.path, this.settings.paths);
+        if (updated) {
+            this.settings.paths = updated;
+            void this.saveSettings();
         }
 
         if (this.settings.protectEnabled && this.isVerifyPasswordCorrect) {
@@ -515,18 +500,11 @@ export default class PasswordPlugin extends Plugin {
     }
 
     isIncludeRootPath(): boolean {
-        if (normalizePath(this.settings.protectedPath) === ROOT_PATH) return true;
-        return this.settings.addedProtectedPath.some(
-            (p) => normalizePath(p) === ROOT_PATH
-        );
+        return anyEntryIsRoot(this.settings.paths);
     }
 
     isProtectedFile(filePath: string): boolean {
-        return isProtectedPath(
-            filePath,
-            this.settings.protectedPath,
-            this.settings.addedProtectedPath
-        );
+        return isProtectedByEntries(filePath, this.settings.paths);
     }
 
     // Migrate from legacy v1 cipher to PBKDF2 hash after successful verification.
@@ -543,11 +521,11 @@ export default class PasswordPlugin extends Plugin {
     }
 
     async saveSettings() {
-        // Phase 1: legacy fields are still the source of truth (the existing
-        // settings UI mutates them directly). Rebuild `paths` on every save,
-        // preserving any modes already set by index. Phase 3 will flip this
-        // direction once the new UI writes to `paths` directly.
-        mirrorLegacyToPaths(this.settings);
+        // `paths` is the v3 source of truth. Recompute the legacy fields
+        // (`protectedPath`, `addedProtectedPath`) from it on every save so
+        // a downgrade to the v2 plugin still finds the primary path and
+        // the first ADD_PATH_MAX added paths.
+        mirrorPathsToLegacy(this.settings);
         await this.saveData(this.settings);
     }
 }
@@ -1201,95 +1179,86 @@ class PasswordSettingTab extends PluginSettingTab {
                 );
         }
 
-        // Primary protected path row.
-        this.buildPathRow(containerEl, 0, locked);
+        // ─── Protected paths section ────────────────────────────────────
+        // Path settings can be edited when protection is off (initial setup)
+        // or when protection is on AND the user is currently unlocked. The
+        // legacy "edit only when off" pattern would have prevented mode
+        // changes during normal use.
+        const canEditPaths =
+            !this.plugin.settings.protectEnabled || this.plugin.isVerifyPasswordCorrect;
 
-        // Added protected paths header + add/remove buttons.
         new Setting(containerEl)
-            .setName(this.plugin.t('setting_more_path'))
-            .setDesc('')
+            .setName(this.plugin.t('protected_paths_section_name'))
+            .setDesc(this.plugin.t('protected_paths_section_desc'))
             .addButton((btn) =>
                 btn
-                    .setButtonText(this.plugin.t('setting_add_path'))
-                    .setDisabled(
-                        locked ||
-                            this.plugin.settings.addedProtectedPath.length >= ADD_PATH_MAX
-                    )
-                    .onClick(async () => {
-                        if (this.plugin.settings.addedProtectedPath.length < ADD_PATH_MAX) {
-                            this.plugin.settings.addedProtectedPath.push('');
-                            await this.plugin.saveSettings();
-                            this.display();
-                        }
-                    })
-            )
-            .addButton((btn) =>
-                btn
-                    .setButtonText(this.plugin.t('setting_remove_path'))
-                    .setDisabled(
-                        locked ||
-                            this.plugin.settings.addedProtectedPath.length === 0
-                    )
-                    .onClick(async () => {
-                        if (this.plugin.settings.addedProtectedPath.length > 0) {
-                            this.plugin.settings.addedProtectedPath.pop();
-                            await this.plugin.saveSettings();
-                            this.display();
-                        }
-                    })
+                    .setButtonText(this.plugin.t('picker_button_label'))
+                    .setCta()
+                    .setDisabled(!canEditPaths)
+                    .onClick(() => this.openPathPicker())
             );
 
-        for (
-            let i = 0;
-            i < this.plugin.settings.addedProtectedPath.length && i < ADD_PATH_MAX;
-            i++
-        ) {
-            this.buildPathRow(containerEl, i + 1, locked);
+        const pathsList = containerEl.createDiv({ cls: 'pw-paths-list' });
+        if (this.plugin.settings.paths.length === 0) {
+            pathsList.createDiv({
+                cls: 'pw-paths-empty',
+                text: this.plugin.t('protected_paths_empty'),
+            });
+        } else {
+            for (let i = 0; i < this.plugin.settings.paths.length; i++) {
+                this.buildPathRow(pathsList, i, canEditPaths);
+            }
         }
     }
 
-    // pathIndex 0 → primary; 1+ → added[pathIndex - 1]
-    private buildPathRow(container: HTMLElement, pathIndex: number, locked: boolean): void {
-        const isPrimary = pathIndex === 0;
-        const entry = this.plugin.settings.paths[pathIndex] ?? {
-            path: isPrimary ? ROOT_PATH : '',
-            mode: 'session' as ProtectionMode,
-        };
-        const initialPath = isPrimary
-            ? this.plugin.settings.protectedPath
-            : this.plugin.settings.addedProtectedPath[pathIndex - 1] ?? '';
+    private openPathPicker() {
+        const initial = new Set(
+            this.plugin.settings.paths
+                .map((e) => (e.path ?? '').trim())
+                .filter((p) => p !== '')
+        );
+        new PathPickerModal(this.app, {
+            initialSelected: initial,
+            t: (k, v) => this.plugin.t(k, v),
+            onConfirm: async (selected) => {
+                // Preserve mode for entries that were already in `paths`,
+                // default new ones to session mode.
+                const oldByPath = new Map<string, ProtectionMode>();
+                for (const e of this.plugin.settings.paths) {
+                    if (e.path) oldByPath.set(e.path, e.mode);
+                }
+                const next: ProtectedPathEntry[] = [];
+                // Stable order: keep the user's existing ordering for entries
+                // they kept; append newly-added entries in path order.
+                const seen = new Set<string>();
+                for (const e of this.plugin.settings.paths) {
+                    if (selected.has(e.path)) {
+                        next.push(e);
+                        seen.add(e.path);
+                    }
+                }
+                const added = [...selected].filter((p) => !seen.has(p)).sort();
+                for (const path of added) {
+                    next.push({ path, mode: oldByPath.get(path) ?? 'session' });
+                }
+                this.plugin.settings.paths = next;
+                await this.plugin.saveSettings();
+                this.display();
+            },
+        }).open();
+    }
+
+    private buildPathRow(
+        container: HTMLElement,
+        entryIndex: number,
+        canEdit: boolean
+    ): void {
+        const entry = this.plugin.settings.paths[entryIndex];
+        if (!entry) return;
 
         const setting = new Setting(container)
-            .setName(
-                isPrimary
-                    ? this.plugin.t('setting_folder_name')
-                    : this.plugin.t('setting_add_path_name')
-            )
-            .setDesc(
-                isPrimary ? this.plugin.t('setting_folder_desc') : ''
-            )
-            .setClass('pw-path-input')
-            .addText((text) =>
-                text
-                    .setPlaceholder(
-                        isPrimary
-                            ? this.plugin.t('place_holder_enter_path')
-                            : this.plugin.t('setting_add_path_place_holder')
-                    )
-                    .setValue(initialPath)
-                    .onChange(async (value) => {
-                        const normalised = value.trim() || (isPrimary ? ROOT_PATH : '');
-                        if (isPrimary) {
-                            this.plugin.settings.protectedPath = normalised || ROOT_PATH;
-                        } else {
-                            this.plugin.settings.addedProtectedPath[pathIndex - 1] =
-                                normalised;
-                        }
-                        await this.plugin.saveSettings();
-                        // Refresh status after path change.
-                        void this.refreshPathStatus(pathIndex, statusEl, actionContainer);
-                    })
-            )
+            .setName(entry.path === ROOT_PATH ? this.plugin.t('picker_root_label') : entry.path)
+            .setClass('pw-path-row')
             .addDropdown((dd) => {
                 dd.addOption('session', this.plugin.t('mode_session'));
                 dd.addOption('encrypted', this.plugin.t('mode_encrypted'));
@@ -1297,29 +1266,36 @@ class PasswordSettingTab extends PluginSettingTab {
                 dd.onChange(async (raw: string) => {
                     const newMode: ProtectionMode = raw === 'encrypted' ? 'encrypted' : 'session';
                     const list = this.plugin.settings.paths;
-                    if (!list[pathIndex]) list[pathIndex] = { path: entry.path, mode: newMode };
-                    else list[pathIndex] = { ...list[pathIndex], mode: newMode };
+                    if (list[entryIndex]) {
+                        list[entryIndex] = { ...list[entryIndex], mode: newMode };
+                    }
                     await this.plugin.saveSettings();
-                    await this.maybeOfferModeFlipBulkOp(pathIndex, newMode);
-                    void this.refreshPathStatus(pathIndex, statusEl, actionContainer);
+                    await this.maybeOfferModeFlipBulkOp(entryIndex, newMode);
+                    void this.refreshPathStatus(entryIndex, statusEl, actionContainer);
                 });
-                if (locked || !this.plugin.isVerifyPasswordCorrect) dd.setDisabled(true);
+                if (!canEdit) dd.setDisabled(true);
             });
 
-        // Status badge — async fill.
         const statusEl = setting.controlEl.createDiv({ cls: 'pw-path-status' });
         statusEl.setText(this.plugin.t('path_status_loading'));
         const actionContainer = setting.controlEl.createDiv({ cls: 'pw-path-action' });
 
-        if (isPrimary) {
-            setting.setDisabled(locked);
-        } else {
-            setting.setDisabled(locked);
+        if (canEdit) {
+            const removeBtn = setting.controlEl.createEl('button', {
+                cls: 'pw-path-remove',
+                text: '✕',
+                attr: { 'aria-label': this.plugin.t('protected_paths_remove_tooltip') },
+            });
+            removeBtn.title = this.plugin.t('protected_paths_remove_tooltip');
+            removeBtn.onclick = async () => {
+                this.plugin.settings.paths.splice(entryIndex, 1);
+                await this.plugin.saveSettings();
+                this.display();
+            };
         }
 
         this.pathInputSettings.push(setting);
-
-        void this.refreshPathStatus(pathIndex, statusEl, actionContainer);
+        void this.refreshPathStatus(entryIndex, statusEl, actionContainer);
     }
 
     private async refreshPathStatus(

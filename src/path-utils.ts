@@ -1,7 +1,10 @@
 import { normalizePath } from 'obsidian';
 
 export const ROOT_PATH = normalizePath('/');
+// Cap on the legacy `addedProtectedPath: string[]` field (preserved for v2
+// downgrade safety). The v3 `paths` array can hold up to MAX_PATHS entries.
 export const ADD_PATH_MAX = 6;
+export const MAX_PATHS = 30;
 
 export type ProtectionMode = 'session' | 'encrypted';
 
@@ -83,6 +86,61 @@ export function replaceProtectedPath(
     }
 
     return null;
+}
+
+// True if `filePath` is covered by any entry in the `paths` list. Mirrors
+// the semantics of `isProtectedPath` but reads from the v3 entries array.
+export function isProtectedByEntries(
+    filePath: string,
+    paths: ProtectedPathEntry[]
+): boolean {
+    if (!filePath) return false;
+    if (anyEntryIsRoot(paths)) return true;
+
+    const target = normalizePath(filePath);
+    for (const entry of paths) {
+        const raw = (entry.path ?? '').trim();
+        if (raw === '') continue;
+        const norm = normalizePath(raw);
+        if (norm === ROOT_PATH) return true;
+        if (target.length < norm.length) continue;
+        if (isChildPath(target, norm)) return true;
+    }
+    return false;
+}
+
+// True if any entry's path normalises to vault root ('/').
+export function anyEntryIsRoot(paths: ProtectedPathEntry[]): boolean {
+    for (const entry of paths) {
+        const raw = (entry.path ?? '').trim();
+        if (raw === '') continue;
+        if (normalizePath(raw) === ROOT_PATH) return true;
+    }
+    return false;
+}
+
+// Updates entries whose path matches a renamed folder. Returns a new array
+// or null if nothing changed. Mode is preserved per entry.
+export function replaceProtectedPathInEntries(
+    oldPath: string,
+    newPath: string,
+    paths: ProtectedPathEntry[]
+): ProtectedPathEntry[] | null {
+    if (!oldPath || !newPath) return null;
+
+    const oldNorm = normalizePath(removeFileExtension(oldPath));
+    const newNorm = normalizePath(removeFileExtension(newPath));
+
+    let changed = false;
+    const result = paths.map((entry) => {
+        const norm = normalizePath((entry.path ?? '').trim());
+        if (norm !== ROOT_PATH && norm.toLowerCase() === oldNorm.toLowerCase()) {
+            changed = true;
+            return { path: newNorm, mode: entry.mode };
+        }
+        return entry;
+    });
+    return changed ? result : null;
 }
 
 // Returns the mode of the longest matching protected path, or null if the

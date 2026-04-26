@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+    anyEntryIsRoot,
     isChildPath,
+    isProtectedByEntries,
     isProtectedPath,
     modeForFile,
     removeFileExtension,
     replaceProtectedPath,
+    replaceProtectedPathInEntries,
     ProtectedPathEntry,
 } from '../src/path-utils';
 
@@ -103,6 +106,73 @@ describe('removeFileExtension', () => {
 
     it('does not strip a dot in a folder name', () => {
         expect(removeFileExtension('foo.bar/baz')).toBe('foo.bar/baz');
+    });
+});
+
+describe('isProtectedByEntries', () => {
+    it('treats a root entry as protecting everything', () => {
+        const paths: ProtectedPathEntry[] = [{ path: '/', mode: 'session' }];
+        expect(isProtectedByEntries('any/file.md', paths)).toBe(true);
+    });
+
+    it('matches by longest prefix and ignores unrelated paths', () => {
+        const paths: ProtectedPathEntry[] = [
+            { path: 'safe', mode: 'session' },
+            { path: 'extra', mode: 'encrypted' },
+        ];
+        expect(isProtectedByEntries('safe/note.md', paths)).toBe(true);
+        expect(isProtectedByEntries('extra/note.md', paths)).toBe(true);
+        expect(isProtectedByEntries('public/note.md', paths)).toBe(false);
+    });
+
+    it('ignores empty path entries', () => {
+        const paths: ProtectedPathEntry[] = [
+            { path: '', mode: 'encrypted' },
+            { path: 'safe', mode: 'session' },
+        ];
+        expect(isProtectedByEntries('public/note.md', paths)).toBe(false);
+    });
+
+    it('returns false for an empty paths list', () => {
+        expect(isProtectedByEntries('any.md', [])).toBe(false);
+    });
+});
+
+describe('anyEntryIsRoot', () => {
+    it('detects a root entry', () => {
+        expect(anyEntryIsRoot([{ path: '/', mode: 'session' }])).toBe(true);
+    });
+
+    it('returns false when only specific paths are present', () => {
+        expect(anyEntryIsRoot([{ path: 'safe', mode: 'session' }])).toBe(false);
+    });
+
+    it('ignores empty path entries', () => {
+        expect(anyEntryIsRoot([{ path: '', mode: 'encrypted' }])).toBe(false);
+    });
+});
+
+describe('replaceProtectedPathInEntries', () => {
+    it('updates the matching entry and preserves mode', () => {
+        const paths: ProtectedPathEntry[] = [
+            { path: 'old', mode: 'encrypted' },
+            { path: 'other', mode: 'session' },
+        ];
+        const updated = replaceProtectedPathInEntries('old', 'new', paths);
+        expect(updated).toEqual([
+            { path: 'new', mode: 'encrypted' },
+            { path: 'other', mode: 'session' },
+        ]);
+    });
+
+    it('returns null when no entry matches', () => {
+        const paths: ProtectedPathEntry[] = [{ path: 'safe', mode: 'session' }];
+        expect(replaceProtectedPathInEntries('different', 'whatever', paths)).toBeNull();
+    });
+
+    it('does not rewrite a root entry', () => {
+        const paths: ProtectedPathEntry[] = [{ path: '/', mode: 'session' }];
+        expect(replaceProtectedPathInEntries('any', 'whatever', paths)).toBeNull();
     });
 });
 

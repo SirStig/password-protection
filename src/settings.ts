@@ -1,12 +1,13 @@
 import type { LangTypeAndAuto } from '../i18n';
 import type { PasswordData } from './crypto';
-import { ROOT_PATH, ADD_PATH_MAX, ProtectedPathEntry } from './path-utils';
+import { ROOT_PATH, ADD_PATH_MAX, MAX_PATHS, ProtectedPathEntry } from './path-utils';
 
 export const SETTINGS_VERSION = 3 as const;
 
 export interface PasswordPluginSettings {
-    // Legacy fields (v2). Source of truth in Phase 1; mirrored from `paths` in
-    // Phase 3 once the settings UI writes to `paths` directly.
+    // Legacy fields (v2). After v3 they are derived mirrors of `paths` —
+    // kept in `data.json` so a downgrade to the v2 plugin still finds the
+    // primary path and the first ADD_PATH_MAX added paths.
     protectedPath: string;
     addedProtectedPath: string[];
     protectEnabled: boolean;
@@ -18,8 +19,8 @@ export interface PasswordPluginSettings {
     autoLockInterval: number;
     pwdHintQuestion: string;
 
-    // v3: per-path mode. `paths[0]` mirrors `protectedPath`, `paths[1..]`
-    // mirror `addedProtectedPath`. Modes are preserved by index across saves.
+    // v3: per-path mode. Source of truth; the legacy fields above are
+    // recomputed from this array on every save.
     paths: ProtectedPathEntry[];
     settingsVersion: typeof SETTINGS_VERSION;
 }
@@ -62,14 +63,15 @@ export function migrateSettings(raw: unknown): PasswordPluginSettings {
         );
         merged.settingsVersion = SETTINGS_VERSION;
     } else {
-        // Already v3+. Trust `paths` but normalise — drop empty entries beyond
-        // the first slot, cap at ADD_PATH_MAX + 1 (one primary + N added).
-        merged.paths = (merged.paths ?? []).slice(0, ADD_PATH_MAX + 1).map((entry, idx) => ({
-            path: typeof entry?.path === 'string' && entry.path.trim() !== ''
-                ? entry.path
-                : (idx === 0 ? ROOT_PATH : ''),
-            mode: entry?.mode === 'encrypted' ? 'encrypted' : 'session',
-        }));
+        // Already v3+. Trust `paths` but normalise — drop empties, coerce
+        // bad mode values, cap at MAX_PATHS.
+        merged.paths = (merged.paths ?? [])
+            .slice(0, MAX_PATHS)
+            .map((entry): ProtectedPathEntry => ({
+                path: typeof entry?.path === 'string' ? entry.path : '',
+                mode: entry?.mode === 'encrypted' ? 'encrypted' : 'session',
+            }))
+            .filter((e) => e.path.trim() !== '');
         if (merged.paths.length === 0) {
             merged.paths = [{ path: ROOT_PATH, mode: 'session' }];
         }
@@ -88,16 +90,26 @@ function buildPathsFromLegacy(
         if (typeof p !== 'string') continue;
         if (p.trim() === '') continue;
         result.push({ path: p, mode: 'session' });
-        if (result.length >= ADD_PATH_MAX + 1) break;
+        if (result.length >= MAX_PATHS) break;
     }
     return result;
 }
 
-// Rebuilds `paths` from the legacy fields, preserving any existing mode by
-// index. Used by `saveSettings` in Phase 1 so the legacy UI's writes to
-// `protectedPath` / `addedProtectedPath` propagate into `paths` without
-// dropping mode information set elsewhere. Phase 3 will flip the mirror
-// direction.
+// Rebuilds the legacy fields from `paths` — `paths` is the v3 source of
+// truth. Legacy fields stay in `data.json` so a downgrade to the v2 plugin
+// still finds the primary path and the first ADD_PATH_MAX added paths;
+// entries beyond that are visible only to v3+. Empty/whitespace entries
+// are filtered out.
+export function mirrorPathsToLegacy(settings: PasswordPluginSettings): void {
+    const live = (settings.paths ?? []).filter(
+        (e) => typeof e?.path === 'string' && e.path.trim() !== ''
+    );
+    settings.protectedPath = live[0]?.path ?? ROOT_PATH;
+    settings.addedProtectedPath = live.slice(1, 1 + ADD_PATH_MAX).map((e) => e.path);
+}
+
+// Kept for backwards-compat with any external callers that may have
+// imported it. Internal code uses `mirrorPathsToLegacy` now.
 export function mirrorLegacyToPaths(settings: PasswordPluginSettings): void {
     const oldPaths = settings.paths ?? [];
     const next: ProtectedPathEntry[] = [

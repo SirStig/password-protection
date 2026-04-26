@@ -3,6 +3,7 @@ import {
     DEFAULT_SETTINGS,
     migrateSettings,
     mirrorLegacyToPaths,
+    mirrorPathsToLegacy,
     SETTINGS_VERSION,
     PasswordPluginSettings,
 } from '../src/settings';
@@ -81,6 +82,64 @@ describe('migrateSettings', () => {
         };
         const result = migrateSettings(v3);
         expect(result.paths[1].mode).toBe('session');
+    });
+});
+
+describe('mirrorPathsToLegacy', () => {
+    it('rebuilds legacy fields from paths', () => {
+        const settings: PasswordPluginSettings = {
+            ...DEFAULT_SETTINGS,
+            protectedPath: 'STALE',
+            addedProtectedPath: ['STALE'],
+            paths: [
+                { path: 'private', mode: 'encrypted' },
+                { path: 'journal', mode: 'session' },
+                { path: 'notes/secret', mode: 'encrypted' },
+            ],
+        };
+        mirrorPathsToLegacy(settings);
+        expect(settings.protectedPath).toBe('private');
+        expect(settings.addedProtectedPath).toEqual(['journal', 'notes/secret']);
+    });
+
+    it('drops empty entries when mirroring', () => {
+        const settings: PasswordPluginSettings = {
+            ...DEFAULT_SETTINGS,
+            paths: [
+                { path: 'private', mode: 'session' },
+                { path: '   ', mode: 'session' },
+                { path: 'journal', mode: 'session' },
+            ],
+        };
+        mirrorPathsToLegacy(settings);
+        expect(settings.protectedPath).toBe('private');
+        expect(settings.addedProtectedPath).toEqual(['journal']);
+    });
+
+    it('caps the legacy added array at ADD_PATH_MAX entries even when paths has more', () => {
+        const settings: PasswordPluginSettings = {
+            ...DEFAULT_SETTINGS,
+            paths: Array.from({ length: 12 }, (_, i) => ({
+                path: `p${i}`,
+                mode: 'session' as const,
+            })),
+        };
+        mirrorPathsToLegacy(settings);
+        expect(settings.protectedPath).toBe('p0');
+        // ADD_PATH_MAX is 6 — so legacy holds p1..p6.
+        expect(settings.addedProtectedPath).toEqual(['p1', 'p2', 'p3', 'p4', 'p5', 'p6']);
+        // The remaining entries (p7..p11) live only in `paths`.
+        expect(settings.paths).toHaveLength(12);
+    });
+
+    it('falls back to root when paths is empty', () => {
+        const settings: PasswordPluginSettings = {
+            ...DEFAULT_SETTINGS,
+            paths: [],
+        };
+        mirrorPathsToLegacy(settings);
+        expect(settings.protectedPath).toBe('/');
+        expect(settings.addedProtectedPath).toEqual([]);
     });
 });
 

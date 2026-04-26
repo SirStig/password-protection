@@ -87,6 +87,19 @@
   "change_password_no_encrypted_files": "No encrypted files found. Updating password only.",
   "change_password_done": "Password changed and {{ok}} file(s) re-encrypted.",
 
+  "picker_modal_title": "Choose paths to protect",
+  "picker_search_placeholder": "Search folders and notes…",
+  "picker_root_label": "Vault root — protect every note",
+  "picker_no_results": "No matching folders or notes.",
+  "picker_truncated": "Showing first {{shown}} of {{total}} matches. Refine your search to narrow.",
+  "picker_selected": "{{count}} selected",
+  "picker_button_label": "Choose paths…",
+
+  "protected_paths_section_name": "Protected paths",
+  "protected_paths_section_desc": "Pick folders or notes to protect, set a mode for each, and run bulk encrypt/decrypt as needed.",
+  "protected_paths_empty": "No paths protected yet. Click \"Choose paths…\" to start.",
+  "protected_paths_remove_tooltip": "Remove this path. Already-encrypted files stay encrypted on disk.",
+
   "menu_encrypt_file": "Encrypt this file",
   "menu_decrypt_file": "Decrypt this file",
   "command_encrypt_current_file": "Encrypt current file",
