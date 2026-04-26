@@ -40,11 +40,51 @@
     margin-left: 4px;
 }
 
+.pw-path-locked-hint {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    font-style: italic;
+    margin-left: 4px;
+    white-space: nowrap;
+}
+
 .pw-bulk-status {
     margin-bottom: 1em;
     font-family: var(--font-monospace);
     font-size: 0.9em;
     word-break: break-all;
+}
+
+.pw-bulk-progress {
+    display: block;
+    width: 100%;
+    height: 6px;
+    margin-bottom: 0.75em;
+    border: none;
+    border-radius: 3px;
+    background: var(--background-modifier-border);
+    overflow: hidden;
+    appearance: none;
+    -webkit-appearance: none;
+}
+.pw-bulk-progress::-webkit-progress-bar {
+    background: var(--background-modifier-border);
+    border-radius: 3px;
+}
+.pw-bulk-progress::-webkit-progress-value {
+    background: var(--interactive-accent);
+    border-radius: 3px;
+    transition: width 0.15s ease;
+}
+.pw-bulk-progress::-moz-progress-bar {
+    background: var(--interactive-accent);
+    border-radius: 3px;
+}
+.pw-bulk-progress.pw-bulk-progress-aborted::-webkit-progress-value {
+    background: var(--text-muted);
+}
+.pw-bulk-progress.pw-bulk-progress-aborted::-moz-progress-bar {
+    background: var(--text-muted);
 }
 
 .pw-bulk-failure-hint {
@@ -196,5 +236,72 @@
 
 .pw-picker-summary {
     color: var(--text-muted);
+    font-size: 0.9em;
+}
+
+/* ── Help icon (badge) ─────────────────────────────────────────────────── */
+
+.pw-help-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 6px;
+    width: 18px;
+    height: 18px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-radius: 50%;
+    vertical-align: middle;
+    transition: color 80ms ease, background-color 80ms ease;
+}
+.pw-help-badge:hover,
+.pw-help-badge:focus-visible {
+    color: var(--interactive-accent);
+    background: var(--background-modifier-hover);
+    outline: none;
+}
+.pw-help-badge svg {
+    width: 14px;
+    height: 14px;
+}
+
+/* ── Help modal ─────────────────────────────────────────────────────────── */
+
+.pw-help-body {
+    padding: 6px 4px 16px 4px;
+    line-height: 1.55;
+    font-size: 0.95em;
+}
+
+.pw-help-body h2 {
+    margin-top: 1.2em;
+    margin-bottom: 0.4em;
+    font-size: 1.05em;
+}
+
+.pw-help-body h3 {
+    margin-top: 1em;
+    margin-bottom: 0.3em;
+    font-size: 1em;
+}
+
+.pw-help-body p {
+    margin: 0.6em 0;
+}
+
+.pw-help-body ul,
+.pw-help-body ol {
+    margin: 0.4em 0 0.4em 1.2em;
+    padding-left: 0.4em;
+}
+
+.pw-help-body li {
+    margin: 0.25em 0;
+}
+
+.pw-help-body code {
+    background: var(--background-modifier-border);
+    padding: 0 4px;
+    border-radius: 3px;
     font-size: 0.9em;
 }

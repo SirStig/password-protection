@@ -11,6 +11,7 @@ import {
     Setting,
     TAbstractFile,
     TFile,
+    TFolder,
     WorkspaceLeaf,
     FileView,
     moment,
@@ -36,6 +37,7 @@ import {
     mirrorPathsToLegacy,
 } from './src/settings';
 import { PathPickerModal } from './src/path-picker';
+import { addHelpIcon } from './src/help-modal';
 import { isEncryptedFile } from './src/encryption';
 import { installVaultPatches, VaultPatchHandle } from './src/vault-patch';
 import {
@@ -624,6 +626,11 @@ class SetPasswordModal extends Modal {
             this.plugin.settings.passwordData = passwordData;
             this.plugin.settings.password = '';
             this.plugin.settings.protectEnabled = true;
+            // Derive the key immediately so the user stays unlocked — they just
+            // proved they know the password by typing it twice.
+            await this.plugin.setEncryptionKeyFromPassword(pw);
+            this.plugin.isVerifyPasswordCorrect = true;
+            this.plugin.lastUnlockOrOpenFileTime = moment();
             this.close();
         };
 
@@ -803,6 +810,7 @@ class BulkConfirmModal extends Modal {
 class BulkProgressModal extends Modal {
     private controller = new AbortController();
     private status: HTMLElement | null = null;
+    private progressBar: HTMLProgressElement | null = null;
     private actionBtn: HTMLButtonElement | null = null;
     private result: BulkResult | null = null;
 
@@ -823,6 +831,10 @@ class BulkProgressModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: this.title });
+
+        this.progressBar = contentEl.createEl('progress', { cls: 'pw-bulk-progress' });
+        this.progressBar.max = 1;
+        this.progressBar.value = 0;
 
         this.status = contentEl.createDiv({ cls: 'pw-bulk-status' });
         this.status.setText('…');
@@ -866,6 +878,10 @@ class BulkProgressModal extends Modal {
     }
 
     private renderProgress(p: BulkProgress) {
+        if (this.progressBar && p.total > 0) {
+            this.progressBar.max = p.total;
+            this.progressBar.value = p.processed;
+        }
         if (!this.status) return;
         this.status.setText(
             this.plugin.t('bulk_running', {
@@ -877,6 +893,11 @@ class BulkProgressModal extends Modal {
     }
 
     private renderResult(r: BulkResult) {
+        if (this.progressBar) {
+            this.progressBar.max = 1;
+            this.progressBar.value = r.aborted ? (r.ok + r.skipped + r.failed.length) / Math.max(r.total, 1) : 1;
+            if (r.aborted) this.progressBar.addClass('pw-bulk-progress-aborted');
+        }
         if (!this.status) return;
         if (r.aborted) {
             this.status.setText(
@@ -1130,9 +1151,17 @@ class PasswordSettingTab extends PluginSettingTab {
 
         const locked = this.plugin.settings.protectEnabled;
 
-        new Setting(containerEl)
+        const autolockSetting = new Setting(containerEl)
             .setName(this.plugin.t('auto_lock_interval_name'))
-            .setDesc(this.plugin.t('auto_lock_interval_desc'))
+            .setDesc(this.plugin.t('auto_lock_interval_desc'));
+        addHelpIcon(
+            autolockSetting,
+            this.app,
+            this.plugin.t('help_autolock_title'),
+            this.plugin.t('help_autolock_body'),
+            this.plugin.t('help_close')
+        );
+        autolockSetting
             .addText((text) =>
                 text
                     .setPlaceholder('0')
@@ -1148,9 +1177,17 @@ class PasswordSettingTab extends PluginSettingTab {
             )
             .setDisabled(locked);
 
-        new Setting(containerEl)
+        const hintSetting = new Setting(containerEl)
             .setName(this.plugin.t('setting_pwd_hint_question_name'))
-            .setDesc(this.plugin.t('setting_pwd_hint_question_desc'))
+            .setDesc(this.plugin.t('setting_pwd_hint_question_desc'));
+        addHelpIcon(
+            hintSetting,
+            this.app,
+            this.plugin.t('help_pwhint_title'),
+            this.plugin.t('help_pwhint_body'),
+            this.plugin.t('help_close')
+        );
+        hintSetting
             .addText((text) =>
                 text
                     .setPlaceholder(this.plugin.t('place_holder_enter_pwd_hint_question'))
@@ -1167,16 +1204,23 @@ class PasswordSettingTab extends PluginSettingTab {
         // Change-password row — only meaningful once a password is set, and
         // requires the user to have verified to be safe.
         if (this.plugin.settings.protectEnabled && this.plugin.isVerifyPasswordCorrect) {
-            new Setting(containerEl)
+            const cpSetting = new Setting(containerEl)
                 .setName(this.plugin.t('setting_change_password_name'))
-                .setDesc(this.plugin.t('setting_change_password_desc'))
-                .addButton((btn) =>
-                    btn
-                        .setButtonText(this.plugin.t('change_password_button'))
-                        .onClick(() => {
-                            new ChangePasswordModal(this.app, this.plugin, () => this.display()).open();
-                        })
-                );
+                .setDesc(this.plugin.t('setting_change_password_desc'));
+            addHelpIcon(
+                cpSetting,
+                this.app,
+                this.plugin.t('help_changepw_title'),
+                this.plugin.t('help_changepw_body'),
+                this.plugin.t('help_close')
+            );
+            cpSetting.addButton((btn) =>
+                btn
+                    .setButtonText(this.plugin.t('change_password_button'))
+                    .onClick(() => {
+                        new ChangePasswordModal(this.app, this.plugin, () => this.display()).open();
+                    })
+            );
         }
 
         // ─── Protected paths section ────────────────────────────────────
@@ -1187,16 +1231,23 @@ class PasswordSettingTab extends PluginSettingTab {
         const canEditPaths =
             !this.plugin.settings.protectEnabled || this.plugin.isVerifyPasswordCorrect;
 
-        new Setting(containerEl)
+        const pathsSection = new Setting(containerEl)
             .setName(this.plugin.t('protected_paths_section_name'))
-            .setDesc(this.plugin.t('protected_paths_section_desc'))
-            .addButton((btn) =>
-                btn
-                    .setButtonText(this.plugin.t('picker_button_label'))
-                    .setCta()
-                    .setDisabled(!canEditPaths)
-                    .onClick(() => this.openPathPicker())
-            );
+            .setDesc(this.plugin.t('protected_paths_section_desc'));
+        addHelpIcon(
+            pathsSection,
+            this.app,
+            this.plugin.t('help_paths_title'),
+            this.plugin.t('help_paths_body'),
+            this.plugin.t('help_close')
+        );
+        pathsSection.addButton((btn) =>
+            btn
+                .setButtonText(this.plugin.t('picker_button_label'))
+                .setCta()
+                .setDisabled(!canEditPaths)
+                .onClick(() => this.openPathPicker())
+        );
 
         const pathsList = containerEl.createDiv({ cls: 'pw-paths-list' });
         if (this.plugin.settings.paths.length === 0) {
@@ -1248,6 +1299,13 @@ class PasswordSettingTab extends PluginSettingTab {
         }).open();
     }
 
+    private pathLabel(path: string): string {
+        const item = this.app.vault.getAbstractFileByPath(path);
+        if (item instanceof TFolder) return '📁 ' + path;
+        if (item instanceof TFile) return '📄 ' + path;
+        return path;
+    }
+
     private buildPathRow(
         container: HTMLElement,
         entryIndex: number,
@@ -1257,7 +1315,7 @@ class PasswordSettingTab extends PluginSettingTab {
         if (!entry) return;
 
         const setting = new Setting(container)
-            .setName(entry.path === ROOT_PATH ? this.plugin.t('picker_root_label') : entry.path)
+            .setName(entry.path === ROOT_PATH ? this.plugin.t('picker_root_label') : this.pathLabel(entry.path))
             .setClass('pw-path-row')
             .addDropdown((dd) => {
                 dd.addOption('session', this.plugin.t('mode_session'));
@@ -1270,6 +1328,25 @@ class PasswordSettingTab extends PluginSettingTab {
                         list[entryIndex] = { ...list[entryIndex], mode: newMode };
                     }
                     await this.plugin.saveSettings();
+
+                    // Tell the user *why* nothing happened if state blocks the
+                    // bulk op (silent early-returns were the original bug).
+                    if (!this.plugin.settings.protectEnabled) {
+                        new Notice(this.plugin.t('notice_mode_set_protect_off'));
+                        void this.refreshPathStatus(entryIndex, statusEl, actionContainer);
+                        return;
+                    }
+                    if (!this.plugin.isVerifyPasswordCorrect || !this.plugin.encryptionKey) {
+                        new Notice(this.plugin.t('notice_mode_set_locked'));
+                        void this.refreshPathStatus(entryIndex, statusEl, actionContainer);
+                        return;
+                    }
+                    if (!this.plugin.vaultPatchHandle) {
+                        new Notice(this.plugin.t('notice_mode_set_no_key'));
+                        void this.refreshPathStatus(entryIndex, statusEl, actionContainer);
+                        return;
+                    }
+
                     await this.maybeOfferModeFlipBulkOp(entryIndex, newMode);
                     void this.refreshPathStatus(entryIndex, statusEl, actionContainer);
                 });
@@ -1335,6 +1412,20 @@ class PasswordSettingTab extends PluginSettingTab {
         const mode = this.plugin.settings.paths[pathIndex]?.mode ?? 'session';
         const canRunBulk =
             this.plugin.settings.protectEnabled && this.plugin.isVerifyPasswordCorrect;
+
+        // When locked: show a subtle "Unlock to encrypt/decrypt" hint so the
+        // user knows the action is available once they unlock.
+        if (!canRunBulk && this.plugin.settings.protectEnabled) {
+            const needsEncrypt = mode === 'encrypted' && counts.encrypted < counts.total && counts.total > 0;
+            const needsDecrypt = mode === 'session' && counts.encrypted > 0;
+            if (needsEncrypt || needsDecrypt) {
+                const hint = actionEl.createEl('span', { cls: 'pw-path-locked-hint' });
+                hint.setText(needsEncrypt
+                    ? this.plugin.t('path_action_unlock_to_encrypt')
+                    : this.plugin.t('path_action_unlock_to_decrypt'));
+            }
+            return;
+        }
         if (!canRunBulk) return;
 
         // Show "Encrypt all" if mode is encrypted but some files are still
@@ -1379,7 +1470,7 @@ class PasswordSettingTab extends PluginSettingTab {
                 }),
                 confirmText: this.plugin.t('mode_flip_yes_now'),
                 cancelText: this.plugin.t('mode_flip_later'),
-                onConfirm: () => this.runEncryptFolderUI(folderPath, remaining),
+                onConfirm: () => this.runFolderBulk('encrypt', folderPath),
             }).open();
         } else {
             if (counts.encrypted <= 0) return;
@@ -1391,9 +1482,50 @@ class PasswordSettingTab extends PluginSettingTab {
                 }),
                 confirmText: this.plugin.t('mode_flip_yes_now'),
                 cancelText: this.plugin.t('mode_flip_later'),
-                onConfirm: () => this.runDecryptFolderUI(folderPath, counts.encrypted),
+                onConfirm: () => this.runFolderBulk('decrypt', folderPath),
             }).open();
         }
+    }
+
+    // One-shot bulk op: progress modal, no extra confirm. Used both from the
+    // mode-flip confirm and from per-row "Encrypt all"/"Decrypt all" buttons
+    // (the per-row buttons add their own confirm before calling this).
+    private async runFolderBulk(
+        phase: 'encrypt' | 'decrypt',
+        folderPath: string
+    ): Promise<void> {
+        if (!this.plugin.encryptionKey || !this.plugin.vaultPatchHandle) {
+            new Notice(this.plugin.t('notice_unlock_first'));
+            return;
+        }
+        const title = this.plugin.t(
+            phase === 'encrypt' ? 'bulk_encrypt_button' : 'bulk_decrypt_button'
+        );
+        const runner = phase === 'encrypt' ? encryptFolder : decryptFolder;
+        const result = await runBulkWithProgressModal(
+            this.app,
+            this.plugin,
+            title,
+            (signal, onProgress) =>
+                runner(
+                    this.app,
+                    folderPath,
+                    this.plugin.encryptionKey as Uint8Array,
+                    this.plugin.vaultPatchHandle as VaultPatchHandle,
+                    onProgress,
+                    signal
+                )
+        );
+        if (!result.aborted && result.failed.length === 0 && result.ok > 0) {
+            new Notice(
+                this.plugin.t('bulk_done', {
+                    ok: String(result.ok),
+                    skipped: String(result.skipped),
+                    failed: '0',
+                })
+            );
+        }
+        this.display();
     }
 
     private runEncryptFolderUI(folderPath: string, count: number) {
@@ -1401,27 +1533,7 @@ class PasswordSettingTab extends PluginSettingTab {
             title: this.plugin.t('bulk_encrypt_confirm_title', { count: String(count) }),
             body: this.plugin.t('bulk_encrypt_confirm_body', { folder: folderPath }),
             confirmText: this.plugin.t('bulk_encrypt_button'),
-            onConfirm: async () => {
-                if (!this.plugin.encryptionKey || !this.plugin.vaultPatchHandle) {
-                    new Notice(this.plugin.t('notice_unlock_first'));
-                    return;
-                }
-                await runBulkWithProgressModal(
-                    this.app,
-                    this.plugin,
-                    this.plugin.t('bulk_encrypt_button'),
-                    (signal, onProgress) =>
-                        encryptFolder(
-                            this.app,
-                            folderPath,
-                            this.plugin.encryptionKey as Uint8Array,
-                            this.plugin.vaultPatchHandle as VaultPatchHandle,
-                            onProgress,
-                            signal
-                        )
-                );
-                this.display();
-            },
+            onConfirm: () => this.runFolderBulk('encrypt', folderPath),
         }).open();
     }
 
@@ -1430,35 +1542,22 @@ class PasswordSettingTab extends PluginSettingTab {
             title: this.plugin.t('bulk_decrypt_confirm_title', { count: String(count) }),
             body: this.plugin.t('bulk_decrypt_confirm_body', { folder: folderPath }),
             confirmText: this.plugin.t('bulk_decrypt_button'),
-            onConfirm: async () => {
-                if (!this.plugin.encryptionKey || !this.plugin.vaultPatchHandle) {
-                    new Notice(this.plugin.t('notice_unlock_first'));
-                    return;
-                }
-                await runBulkWithProgressModal(
-                    this.app,
-                    this.plugin,
-                    this.plugin.t('bulk_decrypt_button'),
-                    (signal, onProgress) =>
-                        decryptFolder(
-                            this.app,
-                            folderPath,
-                            this.plugin.encryptionKey as Uint8Array,
-                            this.plugin.vaultPatchHandle as VaultPatchHandle,
-                            onProgress,
-                            signal
-                        )
-                );
-                this.display();
-            },
+            onConfirm: () => this.runFolderBulk('decrypt', folderPath),
         }).open();
     }
 
     private renderEnableToggle(containerEl: HTMLElement) {
-        new Setting(containerEl)
+        const setting = new Setting(containerEl)
             .setName(this.plugin.t('setting_toggle_name'))
-            .setDesc(this.plugin.t('setting_toggle_desc'))
-            .addToggle((toggle) =>
+            .setDesc(this.plugin.t('setting_toggle_desc'));
+        addHelpIcon(
+            setting,
+            this.app,
+            this.plugin.t('help_toggle_title'),
+            this.plugin.t('help_toggle_body'),
+            this.plugin.t('help_close')
+        );
+        setting.addToggle((toggle) =>
                 toggle
                     .setValue(this.plugin.settings.protectEnabled)
                     .onChange((value) => {
@@ -1466,10 +1565,8 @@ class PasswordSettingTab extends PluginSettingTab {
                             this.plugin.settings.protectEnabled = false;
                             new SetPasswordModal(this.app, this.plugin, () => {
                                 if (this.plugin.settings.protectEnabled) {
-                                    this.plugin.isVerifyPasswordCorrect = false;
-                                    this.plugin.clearEncryptionKey();
-                                    this.plugin.saveSettings();
-                                    void this.plugin.closeAllSensitiveLeaves();
+                                    // User stays unlocked — key was derived inside SetPasswordModal.
+                                    void this.plugin.saveSettings();
                                 }
                                 this.display();
                             }).open();
