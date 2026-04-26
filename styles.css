@@ -48,6 +48,15 @@
     white-space: nowrap;
 }
 
+/* ── Status bar ─────────────────────────────────────────────────────────── */
+
+.pw-status-bar-item {
+    cursor: pointer;
+}
+.pw-status-bar-item:hover {
+    color: var(--text-accent);
+}
+
 .pw-bulk-status {
     margin-bottom: 1em;
     font-family: var(--font-monospace);
@@ -91,6 +100,36 @@
     color: var(--text-error);
     margin-top: 0.5em;
     font-size: 0.85em;
+}
+
+/* ── Settings section headers ─────────────────────────────────────────── */
+
+.pw-section-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 24px 0 6px 0;
+    font-size: 0.78em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+}
+
+.pw-section-locked-tag {
+    font-size: 1em;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-muted);
+    background: var(--background-modifier-border);
+    border-radius: 10px;
+    padding: 1px 8px;
+}
+
+.pw-section-divider {
+    margin: 28px 0 14px 0;
+    border-top: 1px solid var(--background-modifier-border);
 }
 
 /* ── Protected paths list ─────────────────────────────────────────────── */
@@ -237,6 +276,65 @@
 .pw-picker-summary {
     color: var(--text-muted);
     font-size: 0.9em;
+}
+
+/* ── Leaf lock overlay ──────────────────────────────────────────────────── */
+
+.pw-leaf-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    background-color: var(--background-secondary);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    user-select: none;
+}
+
+.pw-leaf-overlay-icon {
+    font-size: 2.2em;
+    opacity: 0.45;
+}
+
+.workspace-leaf-content .view-content {
+    position: relative;
+}
+
+.pw-unlock-host {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    box-sizing: border-box;
+}
+
+.pw-unlock-host.pw-leaf-locked {
+    background-color: var(--background-secondary);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    pointer-events: auto;
+    user-select: none;
+}
+
+.pw-unlock-host.pw-leaf-unlock-form {
+    background-color: var(--background-secondary);
+    padding: 1.25em 1.5em;
+    overflow: auto;
+    align-items: stretch;
+    justify-content: center;
+    pointer-events: auto;
+}
+
+.pw-unlock-host.pw-leaf-unlock-form h2 {
+    margin-top: 0;
+}
+
+.pw-unlock-host.pw-leaf-unlock-form .pw-input-row input[type="password"] {
+    width: 100%;
+    max-width: 100%;
 }
 
 /* ── Help icon (badge) ─────────────────────────────────────────────────── */

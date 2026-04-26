@@ -3,6 +3,7 @@ import {
     normalizePath,
     Menu,
     Modal,
+    EventRef,
     MarkdownRenderChild,
     MarkdownView,
     Notice,
@@ -60,18 +61,189 @@ const PASSWORD_LENGTH_MAX = 20;
 // View types that aggregate content and may expose protected note excerpts.
 const AGGREGATE_VIEW_TYPES = new Set(['search', 'backlink', 'outgoing-link', 'tag']);
 
+function isUnlockContextLeaf(leaf: WorkspaceLeaf, plugin: PasswordPlugin): boolean {
+    if (leaf.view instanceof FileView && leaf.view.file) {
+        return plugin.isProtectedFile(leaf.view.file.path);
+    }
+    return AGGREGATE_VIEW_TYPES.has(leaf.view.getViewType());
+}
+
+async function verifyPluginPassword(
+    password: string,
+    plugin: PasswordPlugin
+): Promise<boolean> {
+    const { settings } = plugin;
+    if (settings.passwordData !== null) {
+        return verifyPasswordHash(password, settings.passwordData);
+    }
+    if (settings.password !== '') {
+        const ok = legacyVerify(password, settings.password);
+        if (ok) await plugin.migratePassword(password);
+        return ok;
+    }
+    return false;
+}
+
+function createPasswordVerifyForm(
+    targetEl: HTMLElement,
+    plugin: PasswordPlugin,
+    onSuccess: (password: string) => void | Promise<void>
+) {
+    targetEl.createEl('h2', { text: plugin.t('verify_password') });
+    const pwWrap = targetEl.createDiv({ cls: 'pw-input-row' });
+    const pwInputEl = pwWrap.createEl('input', { type: 'password' });
+    pwInputEl.placeholder = plugin.t('enter_password');
+
+    const messageEl = targetEl.createDiv({ cls: 'pw-message' });
+    messageEl.setText(plugin.t('enter_password_to_verify'));
+
+    pwInputEl.addEventListener('input', () => {
+        messageEl.style.color = '';
+        messageEl.setText(plugin.t('enter_password_to_verify'));
+    });
+    pwInputEl.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') void pwChecker();
+    });
+
+    const pwChecker = async () => {
+        const pw = pwInputEl.value.normalize('NFC');
+        if (!pw) {
+            messageEl.style.color = 'red';
+            messageEl.setText(plugin.t('password_is_empty'));
+            return;
+        }
+        if (pw.length < PASSWORD_LENGTH_MIN || pw.length > PASSWORD_LENGTH_MAX) {
+            messageEl.style.color = 'red';
+            messageEl.setText(plugin.t('password_not_match'));
+            return;
+        }
+        const ok = await verifyPluginPassword(pw, plugin);
+        if (!ok) {
+            messageEl.style.color = 'red';
+            let text = plugin.t('password_not_match');
+            const hint = plugin.settings.pwdHintQuestion;
+            if (hint) text += `  ${plugin.t('setting_pwd_hint_question_name')}: ${hint}`;
+            messageEl.setText(text);
+            return;
+        }
+        await onSuccess(pw);
+    };
+
+    new Setting(targetEl).addButton((btn) =>
+        btn.setButtonText(plugin.t('ok')).setCta().onClick(() => void pwChecker())
+    );
+
+    return { focus: () => pwInputEl.focus() };
+}
+
+class UnlockFallbackModal extends Modal {
+    constructor(
+        app: App,
+        private plugin: PasswordPlugin
+    ) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        createPasswordVerifyForm(contentEl, this.plugin, async (pw) => {
+            this.plugin.lastUnlockOrOpenFileTime = moment();
+            this.plugin.isVerifyPasswordCorrect = true;
+            await this.plugin.setEncryptionKeyFromPassword(pw);
+            this.close();
+        }).focus();
+    }
+
+    onClose() {
+        this.contentEl.empty();
+        if (this.plugin.unlockSuppressNextModalOnClose) {
+            this.plugin.unlockSuppressNextModalOnClose = false;
+            return;
+        }
+        this.plugin.teardownPasswordUnlockSession(this.plugin.isVerifyPasswordCorrect, {
+            skipModalClose: true,
+        });
+    }
+}
+
+class SettingsPasswordModal extends Modal {
+    private onSubmit: () => void;
+    private dismissOnNavRef: EventRef | null = null;
+    private overlays: HTMLElement[] = [];
+
+    constructor(
+        app: App,
+        private plugin: PasswordPlugin,
+        onSubmit: () => void
+    ) {
+        super(app);
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        this.plugin.isVerifyPasswordWaitting = true;
+        this.plugin.isVerifyPasswordCorrect = false;
+        const bg = this.containerEl.querySelector('.modal-bg') as HTMLElement | null;
+        if (bg) bg.style.pointerEvents = 'none';
+
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (!(leaf.view instanceof FileView) || !leaf.view.file) return;
+            if (!this.plugin.isProtectedFile(leaf.view.file.path)) return;
+            const overlay = leaf.view.contentEl.createDiv({ cls: 'pw-leaf-overlay' });
+            overlay.createDiv({ cls: 'pw-leaf-overlay-icon' }).setText('🔒');
+            this.overlays.push(overlay);
+        });
+
+        this.dismissOnNavRef = this.app.workspace.on('active-leaf-change', (leaf) => {
+            if (!leaf) return;
+            const isContext = isUnlockContextLeaf(leaf, this.plugin);
+            if (!isContext) this.close();
+        });
+
+        const { contentEl } = this;
+        contentEl.empty();
+        createPasswordVerifyForm(contentEl, this.plugin, async (pw) => {
+            this.plugin.lastUnlockOrOpenFileTime = moment();
+            this.plugin.isVerifyPasswordCorrect = true;
+            await this.plugin.setEncryptionKeyFromPassword(pw);
+            this.close();
+        }).focus();
+    }
+
+    onClose() {
+        this.plugin.isVerifyPasswordWaitting = false;
+        this.contentEl.empty();
+        for (const overlay of this.overlays) overlay.remove();
+        this.overlays = [];
+        if (this.dismissOnNavRef) {
+            this.app.workspace.offref(this.dismissOnNavRef);
+            this.dismissOnNavRef = null;
+        }
+        this.onSubmit();
+    }
+}
+
 export default class PasswordPlugin extends Plugin {
     settings: PasswordPluginSettings;
     isVerifyPasswordWaitting = false;
     isVerifyPasswordCorrect = false;
     lastUnlockOrOpenFileTime: moment.Moment | null = null;
     passwordRibbonBtn: HTMLElement;
+    statusBarItem: HTMLElement | null = null;
     i18n: I18n;
 
     // In-memory key for AES-GCM file encryption. Set on successful unlock,
     // zeroed on every transition that locks the vault. Never persisted.
     encryptionKey: Uint8Array | null = null;
     vaultPatchHandle: VaultPatchHandle | null = null;
+    // Tracks per-file encryption state set during this session so context menus
+    // can show only the relevant action (true = encrypted, false = plaintext).
+    fileEncryptionCache = new Map<string, boolean>();
+    private unlockSession: { closeLeafOnCancel: boolean; leafToClose: WorkspaceLeaf | null } | null = null;
+    private unlockFallbackModal: Modal | null = null;
+    private unlockEventRefs: EventRef[] = [];
+    unlockSuppressNextModalOnClose = false;
 
     t = (x: TransItemType, vars?: Record<string, string>) => this.i18n.t(x, vars);
 
@@ -89,6 +261,55 @@ export default class PasswordPlugin extends Plugin {
     clearEncryptionKey(): void {
         if (this.encryptionKey) this.encryptionKey.fill(0);
         this.encryptionKey = null;
+    }
+
+    updateStatusBar(): void {
+        if (!this.statusBarItem) return;
+        if (!this.settings.protectEnabled) {
+            this.statusBarItem.style.display = 'none';
+            return;
+        }
+        this.statusBarItem.style.display = '';
+        this.statusBarItem.setText(
+            this.isVerifyPasswordCorrect
+                ? this.t('status_bar_unlocked')
+                : this.t('status_bar_locked')
+        );
+    }
+
+    async bulkFolderOp(phase: 'encrypt' | 'decrypt', folderPath: string): Promise<void> {
+        if (!this.encryptionKey || !this.vaultPatchHandle) {
+            new Notice(this.t('notice_unlock_first'));
+            return;
+        }
+        const title = this.t(phase === 'encrypt' ? 'bulk_encrypt_button' : 'bulk_decrypt_button');
+        const runner = phase === 'encrypt' ? encryptFolder : decryptFolder;
+        await runBulkWithProgressModal(
+            this.app,
+            this,
+            title,
+            (signal, onProgress) =>
+                runner(
+                    this.app,
+                    folderPath,
+                    this.encryptionKey as Uint8Array,
+                    this.vaultPatchHandle as VaultPatchHandle,
+                    onProgress,
+                    signal
+                )
+        );
+    }
+
+    confirmBulkFolderOp(phase: 'encrypt' | 'decrypt', folderPath: string, count: number): void {
+        const titleKey = phase === 'encrypt' ? 'bulk_encrypt_confirm_title' : 'bulk_decrypt_confirm_title';
+        const bodyKey = phase === 'encrypt' ? 'bulk_encrypt_confirm_body' : 'bulk_decrypt_confirm_body';
+        const btnKey = phase === 'encrypt' ? 'bulk_encrypt_button' : 'bulk_decrypt_button';
+        new BulkConfirmModal(this.app, this, {
+            title: this.t(titleKey, { count: String(count) }),
+            body: this.t(bodyKey, { folder: folderPath }),
+            confirmText: this.t(btnKey),
+            onConfirm: () => void this.bulkFolderOp(phase, folderPath),
+        }).open();
     }
 
     requireEncryptionKey(): Uint8Array {
@@ -117,6 +338,20 @@ export default class PasswordPlugin extends Plugin {
             this.t('open_password_protection'),
             () => this.openPasswordProtection()
         );
+
+        const statusBarItem = this.addStatusBarItem();
+        statusBarItem.addClass('pw-status-bar-item');
+        statusBarItem.style.display = 'none';
+        statusBarItem.addEventListener('click', () => {
+            if (!this.settings.protectEnabled) return;
+            if (this.isVerifyPasswordCorrect) {
+                void this.openPasswordProtection();
+            } else {
+                this.verifyPasswordProtection(false);
+            }
+        });
+        this.statusBarItem = statusBarItem;
+        this.updateStatusBar();
 
         this.addCommand({
             id: 'open-password-protection',
@@ -205,25 +440,152 @@ export default class PasswordPlugin extends Plugin {
             });
         });
 
-        // Per-file context-menu items. Both items always show; the handlers
-        // verify state and surface a notice if the file is already in the
-        // requested mode.
+        // Context menus: file, folder, multi-select, and editor.
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu: Menu, file: TAbstractFile) => {
+                // ── Folder ──────────────────────────────────────────────
+                if (file instanceof TFolder) {
+                    const folderPath = file.isRoot() ? ROOT_PATH : file.path;
+                    const alreadyProtected = this.settings.paths.some(e => e.path === folderPath);
+                    const pathEntry = this.settings.paths.find(e => e.path === folderPath);
+                    const unlocked = this.settings.protectEnabled && this.isVerifyPasswordCorrect;
+
+                    if (this.settings.protectEnabled && !alreadyProtected) {
+                        menu.addItem((item) =>
+                            item
+                                .setTitle(this.t('folder_menu_protect'))
+                                .setIcon('shield')
+                                .onClick(async () => {
+                                    this.settings.paths.push({ path: folderPath, mode: 'session' });
+                                    await this.saveSettings();
+                                })
+                        );
+                    }
+
+                    if (unlocked && pathEntry?.mode === 'encrypted') {
+                        menu.addItem((item) =>
+                            item
+                                .setTitle(this.t('folder_menu_encrypt_all'))
+                                .setIcon('lock')
+                                .onClick(() => void (async () => {
+                                    const counts = await countEncryptedInFolder(
+                                        this.app, folderPath, this.vaultPatchHandle!
+                                    );
+                                    const remaining = counts.total - counts.encrypted;
+                                    if (remaining > 0) this.confirmBulkFolderOp('encrypt', folderPath, remaining);
+                                })())
+                        );
+                        menu.addItem((item) =>
+                            item
+                                .setTitle(this.t('folder_menu_decrypt_all'))
+                                .setIcon('unlock')
+                                .onClick(() => void (async () => {
+                                    const counts = await countEncryptedInFolder(
+                                        this.app, folderPath, this.vaultPatchHandle!
+                                    );
+                                    if (counts.encrypted > 0) this.confirmBulkFolderOp('decrypt', folderPath, counts.encrypted);
+                                })())
+                        );
+                        menu.addItem((item) =>
+                            item
+                                .setTitle(this.t('folder_menu_set_session'))
+                                .setIcon('eye')
+                                .onClick(async () => {
+                                    const idx = this.settings.paths.findIndex(e => e.path === folderPath);
+                                    if (idx >= 0) {
+                                        this.settings.paths[idx] = { ...this.settings.paths[idx], mode: 'session' };
+                                        await this.saveSettings();
+                                    }
+                                })
+                        );
+                    }
+                    return;
+                }
+
+                // ── Single .md file ──────────────────────────────────────
                 if (!(file instanceof TFile) || file.extension !== 'md') return;
+
+                if (this.settings.protectEnabled && !this.isProtectedFile(file.path)) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle(this.t('file_menu_add_protection'))
+                            .setIcon('shield')
+                            .onClick(async () => {
+                                this.settings.paths.push({ path: file.path, mode: 'session' });
+                                await this.saveSettings();
+                            })
+                    );
+                }
+
                 if (!this.settings.protectEnabled || !this.isVerifyPasswordCorrect) return;
+                const knownState = this.fileEncryptionCache.get(file.path);
+                if (knownState !== true) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle(this.t('menu_encrypt_file'))
+                            .setIcon('lock')
+                            .onClick(() => void this.encryptCurrentFile(file))
+                    );
+                }
+                if (knownState !== false) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle(this.t('menu_decrypt_file'))
+                            .setIcon('unlock')
+                            .onClick(() => void this.decryptCurrentFile(file))
+                    );
+                }
+            })
+        );
+
+        this.registerEvent(
+            this.app.workspace.on('files-menu', (menu: Menu, files: TAbstractFile[]) => {
+                if (!this.settings.protectEnabled || !this.isVerifyPasswordCorrect) return;
+                const mdFiles = files.filter(
+                    (f): f is TFile => f instanceof TFile && f.extension === 'md'
+                );
+                if (mdFiles.length === 0) return;
                 menu.addItem((item) =>
                     item
-                        .setTitle(this.t('menu_encrypt_file'))
+                        .setTitle(this.t('multi_menu_encrypt'))
                         .setIcon('lock')
-                        .onClick(() => void this.encryptCurrentFile(file))
+                        .onClick(() => {
+                            for (const f of mdFiles) void this.encryptCurrentFile(f);
+                        })
                 );
                 menu.addItem((item) =>
                     item
-                        .setTitle(this.t('menu_decrypt_file'))
+                        .setTitle(this.t('multi_menu_decrypt'))
                         .setIcon('unlock')
-                        .onClick(() => void this.decryptCurrentFile(file))
+                        .onClick(() => {
+                            for (const f of mdFiles) void this.decryptCurrentFile(f);
+                        })
                 );
+            })
+        );
+
+        this.registerEvent(
+            this.app.workspace.on('editor-menu', (menu: Menu, _editor, info) => {
+                if (!(info instanceof MarkdownView) || !info.file) return;
+                if (!this.settings.protectEnabled || !this.isVerifyPasswordCorrect) return;
+                if (info.file.extension !== 'md') return;
+                const knownState = this.fileEncryptionCache.get(info.file.path);
+                if (knownState !== true) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle(this.t('menu_encrypt_file'))
+                            .setIcon('lock')
+                            .onClick(() => void this.encryptCurrentFile(info.file!))
+                    );
+                }
+                if (knownState !== false) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle(this.t('menu_decrypt_file'))
+                            .setIcon('unlock')
+                            .onClick(() => void this.decryptCurrentFile(info.file!))
+                    );
+                }
             })
         );
 
@@ -264,8 +626,10 @@ export default class PasswordPlugin extends Plugin {
         try {
             const r = await encryptSingleFile(file, this.encryptionKey, this.vaultPatchHandle);
             if (r === 'already-encrypted') {
+                this.fileEncryptionCache.set(file.path, true);
                 new Notice(this.t('notice_already_encrypted', { path: file.path }));
             } else {
+                this.fileEncryptionCache.set(file.path, true);
                 new Notice(this.t('notice_file_encrypted', { path: file.path }));
                 void this.rerenderMarkdownViews();
             }
@@ -284,8 +648,10 @@ export default class PasswordPlugin extends Plugin {
         try {
             const r = await decryptSingleFile(file, this.encryptionKey, this.vaultPatchHandle);
             if (r === 'already-plaintext') {
+                this.fileEncryptionCache.set(file.path, false);
                 new Notice(this.t('notice_already_plaintext', { path: file.path }));
             } else {
+                this.fileEncryptionCache.set(file.path, false);
                 new Notice(this.t('notice_file_decrypted', { path: file.path }));
                 void this.rerenderMarkdownViews();
             }
@@ -343,6 +709,7 @@ export default class PasswordPlugin extends Plugin {
         if (elapsed >= this.settings.autoLockInterval) {
             this.isVerifyPasswordCorrect = false;
             this.clearEncryptionKey();
+            this.updateStatusBar();
             const sensitiveOpen =
                 this.isProtectFileOpened() || (await this.isEncryptedFileOpen());
             if (sensitiveOpen) {
@@ -437,6 +804,7 @@ export default class PasswordPlugin extends Plugin {
             this.isVerifyPasswordCorrect = false;
             this.clearEncryptionKey();
             await this.closeAllSensitiveLeaves();
+            this.updateStatusBar();
         }
     }
 
@@ -455,46 +823,184 @@ export default class PasswordPlugin extends Plugin {
 
     verifyPasswordProtection(closeLeafOnCancel: boolean, leafToClose?: WorkspaceLeaf | null) {
         if (this.isVerifyPasswordWaitting) return;
-        new VerifyPasswordModal(
-            this.app,
-            this,
-            closeLeafOnCancel,
-            leafToClose ?? null,
-            () => {
-                if (this.isVerifyPasswordCorrect) {
-                    new Notice(this.t('password_protection_closed'));
-                    void this.rerenderMarkdownViews();
-                } else {
-                    void this.closeAllSensitiveLeaves();
-                }
-            }
-        ).open();
+        this.isVerifyPasswordWaitting = true;
+        this.isVerifyPasswordCorrect = false;
+        this.unlockSession = { closeLeafOnCancel, leafToClose: leafToClose ?? null };
+        this.registerUnlockSessionEvents();
+        this.rebuildPasswordUnlock('init');
     }
 
-    async rerenderMarkdownViews() {
-        // Reading-mode renders pick up the new (decrypted) content via the
-        // patched cachedRead, so a forced rerender is enough.
-        const encryptedLeaves: { leaf: WorkspaceLeaf; file: TFile }[] = [];
-        this.app.workspace.iterateAllLeaves((leaf) => {
-            if (leaf.view.getViewType() === 'markdown') {
-                (leaf.view as MarkdownView).previewMode?.rerender(true);
-                const view = leaf.view as MarkdownView;
-                if (view.file && view.file.extension === 'md') {
-                    encryptedLeaves.push({ leaf, file: view.file });
+    private registerUnlockSessionEvents() {
+        this.clearUnlockEventRefs();
+        this.unlockEventRefs.push(
+            this.app.workspace.on('active-leaf-change', (leaf) => {
+                if (this.isVerifyPasswordWaitting) {
+                    this.rebuildPasswordUnlock('active-leaf-change', leaf);
                 }
+            })
+        );
+        this.unlockEventRefs.push(
+            this.app.workspace.on('file-open', () => {
+                if (this.isVerifyPasswordWaitting) {
+                    this.rebuildPasswordUnlock('file-open');
+                }
+            })
+        );
+        this.unlockEventRefs.push(
+            this.app.workspace.on('layout-change', () => {
+                if (this.isVerifyPasswordWaitting) {
+                    this.rebuildPasswordUnlock('layout');
+                }
+            })
+        );
+    }
+
+    private clearUnlockEventRefs() {
+        for (const r of this.unlockEventRefs) {
+            this.app.workspace.offref(r);
+        }
+        this.unlockEventRefs = [];
+    }
+
+    private clearUnlockHostsInWorkspace() {
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            const view = leaf.view as { contentEl?: HTMLElement };
+            const ce = view?.contentEl;
+            if (!ce) return;
+            ce.querySelectorAll('.pw-unlock-host').forEach((el) => el.remove());
+        });
+    }
+
+    private mountPasswordFormInto(host: HTMLElement) {
+        host.addClass('pw-leaf-unlock-form');
+        createPasswordVerifyForm(host, this, (pw) => {
+            this.lastUnlockOrOpenFileTime = moment();
+            this.isVerifyPasswordCorrect = true;
+            void (async () => {
+                await this.setEncryptionKeyFromPassword(pw);
+                this.teardownPasswordUnlockSession(true);
+            })();
+        }).focus();
+    }
+
+    private rebuildPasswordUnlock(
+        source: 'init' | 'file-open' | 'layout' | 'active-leaf-change',
+        activeLeafParam?: WorkspaceLeaf | null
+    ) {
+        const active =
+            source === 'active-leaf-change' && activeLeafParam !== undefined
+                ? activeLeafParam
+                : this.app.workspace.activeLeaf;
+
+        if (source === 'active-leaf-change' && active) {
+            if (!isUnlockContextLeaf(active, this)) {
+                this.teardownPasswordUnlockSession(false);
+                return;
+            }
+        }
+        if (source === 'active-leaf-change' && !active) {
+            return;
+        }
+
+        this.clearUnlockHostsInWorkspace();
+        if (this.unlockFallbackModal) {
+            const m = this.unlockFallbackModal;
+            this.unlockFallbackModal = null;
+            this.unlockSuppressNextModalOnClose = true;
+            m.close();
+        }
+
+        let placedForm = false;
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (!(leaf.view instanceof FileView) || !leaf.view.file) return;
+            if (!this.isProtectedFile(leaf.view.file.path)) return;
+            const host = leaf.view.contentEl.createDiv({ cls: 'pw-unlock-host' });
+            if (active && leaf === active && isUnlockContextLeaf(active, this)) {
+                this.mountPasswordFormInto(host);
+                placedForm = true;
+            } else {
+                host.addClass('pw-leaf-locked');
+                host.createDiv({ cls: 'pw-leaf-overlay-icon' }).setText('🔒');
             }
         });
 
-        // For source / live-preview mode, the editor still holds the
-        // ciphertext that cachedRead returned before unlock. Re-open the file
-        // so Obsidian re-reads it through the now-decrypting wrapper.
+        if (
+            active &&
+            isUnlockContextLeaf(active, this) &&
+            !placedForm &&
+            AGGREGATE_VIEW_TYPES.has(active.view.getViewType())
+        ) {
+            const ce = (active.view as unknown as { contentEl: HTMLElement }).contentEl;
+            const host = ce.createDiv({ cls: 'pw-unlock-host' });
+            this.mountPasswordFormInto(host);
+            placedForm = true;
+        }
+
+        if (!placedForm) {
+            const m = new UnlockFallbackModal(this.app, this);
+            this.unlockFallbackModal = m;
+            m.open();
+        }
+    }
+
+    teardownPasswordUnlockSession(
+        verified: boolean,
+        options?: { skipModalClose?: boolean }
+    ) {
+        if (!this.isVerifyPasswordWaitting) return;
+        this.isVerifyPasswordWaitting = false;
+        this.clearUnlockHostsInWorkspace();
+        this.clearUnlockEventRefs();
+        const s = this.unlockSession;
+        this.unlockSession = null;
+        if (!verified) {
+            this.isVerifyPasswordCorrect = false;
+        }
+        if (this.unlockFallbackModal) {
+            const m = this.unlockFallbackModal;
+            this.unlockFallbackModal = null;
+            if (!options?.skipModalClose) m.close();
+        }
+        if (!verified && s?.closeLeafOnCancel) {
+            (s.leafToClose ?? this.app.workspace.activeLeaf)?.detach();
+        }
+        this.updateStatusBar();
+        if (verified) {
+            new Notice(this.t('password_protection_closed'));
+            setTimeout(() => void this.rerenderMarkdownViews(), 0);
+        } else {
+            void this.closeAllSensitiveLeaves();
+        }
+    }
+
+    async rerenderMarkdownViews() {
         if (!this.vaultPatchHandle) return;
-        for (const { leaf, file } of encryptedLeaves) {
+
+        const leaves: { leaf: WorkspaceLeaf; file: TFile }[] = [];
+        this.app.workspace.iterateAllLeaves((leaf) => {
+            if (leaf.view.getViewType() !== 'markdown') return;
+            const view = leaf.view as MarkdownView;
+            if (view.file?.extension === 'md') leaves.push({ leaf, file: view.file });
+        });
+
+        for (const { leaf, file } of leaves) {
             try {
                 const raw = await this.vaultPatchHandle.originalRead(file);
                 if (!isEncryptedFile(raw)) continue;
-                const state = leaf.getViewState();
-                await leaf.openFile(file, { state: state.state });
+
+                // vault.read goes through the patched (now-decrypting) wrapper.
+                const plaintext = await this.app.vault.read(file);
+                const view = leaf.view as MarkdownView;
+
+                // Push plaintext into the CM6 editor (source / live-preview).
+                // leaf.openFile can silently skip a reload when the same file is
+                // already loaded in the leaf, leaving ciphertext in the editor.
+                if (view.editor) {
+                    view.editor.setValue(plaintext);
+                }
+
+                // Refresh reading-mode renderer.
+                view.previewMode?.rerender(true);
             } catch {
                 // file gone or unreadable — leave the leaf as-is
             }
@@ -645,121 +1151,6 @@ class SetPasswordModal extends Modal {
 
     onClose() {
         this.contentEl.empty();
-        this.onSubmit();
-    }
-}
-
-// ─── Verify password modal ────────────────────────────────────────────────────
-
-class VerifyPasswordModal extends Modal {
-    private onSubmit: () => void;
-
-    constructor(
-        app: App,
-        private plugin: PasswordPlugin,
-        private readonly closeLeafOnCancel: boolean,
-        private readonly leafToClose: WorkspaceLeaf | null,
-        onSubmit: () => void
-    ) {
-        super(app);
-        this.plugin.isVerifyPasswordWaitting = true;
-        this.plugin.isVerifyPasswordCorrect = false;
-        this.onSubmit = onSubmit;
-    }
-
-    onOpen() {
-        // Blur the workspace content while locked.
-        Object.assign(this.app.workspace.containerEl.style, {
-            filter: 'blur(16px)',
-        } as CSSStyleDeclaration);
-
-        const { contentEl } = this;
-        contentEl.empty();
-        contentEl.createEl('h2', { text: this.plugin.t('verify_password') });
-
-        const pwWrap = contentEl.createDiv({ cls: 'pw-input-row' });
-        const pwInputEl = pwWrap.createEl('input', { type: 'password' });
-        pwInputEl.placeholder = this.plugin.t('enter_password');
-        pwInputEl.focus();
-
-        const messageEl = contentEl.createDiv({ cls: 'pw-message' });
-        messageEl.setText(this.plugin.t('enter_password_to_verify'));
-
-        pwInputEl.addEventListener('input', () => {
-            messageEl.style.color = '';
-            messageEl.setText(this.plugin.t('enter_password_to_verify'));
-        });
-        pwInputEl.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') void pwChecker();
-        });
-
-        const pwChecker = async () => {
-            const pw = pwInputEl.value.normalize('NFC');
-            if (!pw) {
-                messageEl.style.color = 'red';
-                messageEl.setText(this.plugin.t('password_is_empty'));
-                return;
-            }
-            if (pw.length < PASSWORD_LENGTH_MIN || pw.length > PASSWORD_LENGTH_MAX) {
-                messageEl.style.color = 'red';
-                messageEl.setText(this.plugin.t('password_not_match'));
-                return;
-            }
-
-            const ok = await this.verifyInput(pw);
-            if (!ok) {
-                messageEl.style.color = 'red';
-                let text = this.plugin.t('password_not_match');
-                const hint = this.plugin.settings.pwdHintQuestion;
-                if (hint) text += `  ${this.plugin.t('setting_pwd_hint_question_name')}: ${hint}`;
-                messageEl.setText(text);
-                return;
-            }
-
-            this.plugin.lastUnlockOrOpenFileTime = moment();
-            this.plugin.isVerifyPasswordCorrect = true;
-            // Derive the AES-GCM file-encryption key while the plaintext
-            // password is in scope. Cached on the plugin instance until lock.
-            await this.plugin.setEncryptionKeyFromPassword(pw);
-            this.close();
-        };
-
-        new Setting(contentEl).addButton((btn) =>
-            btn.setButtonText(this.plugin.t('ok')).setCta().onClick(() => void pwChecker())
-        );
-    }
-
-    private async verifyInput(password: string): Promise<boolean> {
-        const { settings } = this.plugin;
-        if (settings.passwordData !== null) {
-            return verifyPasswordHash(password, settings.passwordData);
-        }
-        if (settings.password !== '') {
-            const ok = legacyVerify(password, settings.password);
-            if (ok) await this.plugin.migratePassword(password);
-            return ok;
-        }
-        return false;
-    }
-
-    private restoreBlur() {
-        Object.assign(this.app.workspace.containerEl.style, {
-            filter: '',
-        } as CSSStyleDeclaration);
-    }
-
-    onClose() {
-        this.plugin.isVerifyPasswordWaitting = false;
-        this.contentEl.empty();
-        this.restoreBlur();
-
-        // If the user dismissed without unlocking and the triggering view must be
-        // closed (e.g. search, backlink), detach that leaf instead of looping.
-        if (this.closeLeafOnCancel && !this.plugin.isVerifyPasswordCorrect) {
-            const target = this.leafToClose ?? this.app.workspace.activeLeaf;
-            target?.detach();
-        }
-
         this.onSubmit();
     }
 }
@@ -1147,9 +1538,13 @@ class PasswordSettingTab extends PluginSettingTab {
 
         this.renderEnableToggle(containerEl);
 
-        containerEl.createEl('h6', { text: this.plugin.t('before_open_protection') });
-
         const locked = this.plugin.settings.protectEnabled;
+
+        const lockSectionEl = containerEl.createDiv({ cls: 'pw-section-header' });
+        lockSectionEl.createSpan({ text: this.plugin.t('section_lock_behavior') });
+        if (locked) {
+            lockSectionEl.createSpan({ cls: 'pw-section-locked-tag', text: this.plugin.t('section_locked_tag') });
+        }
 
         const autolockSetting = new Setting(containerEl)
             .setName(this.plugin.t('auto_lock_interval_name'))
@@ -1201,9 +1596,7 @@ class PasswordSettingTab extends PluginSettingTab {
             )
             .setDisabled(locked);
 
-        // Change-password row — only meaningful once a password is set, and
-        // requires the user to have verified to be safe.
-        if (this.plugin.settings.protectEnabled && this.plugin.isVerifyPasswordCorrect) {
+        if (this.plugin.settings.protectEnabled) {
             const cpSetting = new Setting(containerEl)
                 .setName(this.plugin.t('setting_change_password_name'))
                 .setDesc(this.plugin.t('setting_change_password_desc'));
@@ -1217,6 +1610,7 @@ class PasswordSettingTab extends PluginSettingTab {
             cpSetting.addButton((btn) =>
                 btn
                     .setButtonText(this.plugin.t('change_password_button'))
+                    .setDisabled(!this.plugin.isVerifyPasswordCorrect)
                     .onClick(() => {
                         new ChangePasswordModal(this.app, this.plugin, () => this.display()).open();
                     })
@@ -1230,6 +1624,8 @@ class PasswordSettingTab extends PluginSettingTab {
         // changes during normal use.
         const canEditPaths =
             !this.plugin.settings.protectEnabled || this.plugin.isVerifyPasswordCorrect;
+
+        containerEl.createDiv({ cls: 'pw-section-divider' });
 
         const pathsSection = new Setting(containerEl)
             .setName(this.plugin.t('protected_paths_section_name'))
@@ -1567,24 +1963,19 @@ class PasswordSettingTab extends PluginSettingTab {
                                 if (this.plugin.settings.protectEnabled) {
                                     // User stays unlocked — key was derived inside SetPasswordModal.
                                     void this.plugin.saveSettings();
+                                    this.plugin.updateStatusBar();
                                 }
                                 this.display();
                             }).open();
                         } else {
                             if (!this.plugin.isVerifyPasswordWaitting) {
-                                new VerifyPasswordModal(
-                                    this.app,
-                                    this.plugin,
-                                    false,
-                                    null,
-                                    () => {
-                                        if (this.plugin.isVerifyPasswordCorrect) {
-                                            void this.handleDisableProtection();
-                                        } else {
-                                            this.display();
-                                        }
+                                new SettingsPasswordModal(this.app, this.plugin, () => {
+                                    if (this.plugin.isVerifyPasswordCorrect) {
+                                        void this.handleDisableProtection();
+                                    } else {
+                                        this.display();
                                     }
-                                ).open();
+                                }).open();
                             }
                         }
                     })
@@ -1643,6 +2034,7 @@ class PasswordSettingTab extends PluginSettingTab {
         this.plugin.clearEncryptionKey();
         void this.plugin.saveSettings();
         void this.plugin.closeAllSensitiveLeaves();
+        this.plugin.updateStatusBar();
         this.display();
     }
 }
